@@ -15,7 +15,7 @@ import streamlit as st
 from python_calamine import CalamineWorkbook
 import xlsxwriter
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v3.7"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v3.9"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -607,7 +607,7 @@ def send_email_message(to_email, subject, body, sender_name="", reply_to="", cc_
 
 
 def send_response_notifications(conf, token, submitted_rows, answers_map, note, profile, first_registration=False, decline_map=None):
-    """Send one automatic receipt email to the respondent and BCC the office.
+    """Send one automatic receipt email to the respondent and CC the office.
 
     The administrator edits only the plain subject and introductory text.  All
     response/profile details below are generated automatically, so no merge
@@ -1041,13 +1041,11 @@ def conference_settings_form(conf=None, key_prefix="conf"):
     invitation_label = st.text_input("表示名", value="派遣依頼状（招聘状）の発行について" if is_new else conf["invitation_label"] or "派遣依頼状（招聘状）の発行について", disabled=not invitation_enabled, key=f"{key_prefix}_invitation_label")
 
     st.markdown("#### 回答受付メール")
-    st.caption("回答登録時は、回答者へ自動返信し、同じメールを運営事務局へBCC送信します。ON/OFF設定はありません。")
+    st.caption("回答登録時は、回答者へ自動返信し、同じメールを運営事務局へCC送信します。ON/OFF設定はありません。")
     reply_to_email = st.text_input("運営事務局メールアドレス（Reply-To・CC先）", value="" if is_new else (conf["reply_to_email"] or conf["office_email"] or ""), placeholder="例：jsrr17@gakkai.co.jp", key=f"{key_prefix}_reply_to")
-    if is_new:
-        sender_name_default = (name + " 運営事務局") if name else "運営事務局"
-    else:
-        sender_name_default = (conf["sender_name"] or ((name + " 運営事務局") if name else "運営事務局"))
-    sender_name = st.text_input("メール差出人表示名", value=sender_name_default, key=f"{key_prefix}_sender_name")
+    # 差出人アドレスはシステム共通SMTPを使用。表示名は学会名から自動生成。
+    sender_name = (name + " 運営事務局") if name else "登壇諾否マイページ"
+    st.caption(f"差出人表示名：{sender_name}（自動）／送信元アドレスはシステム共通設定を使用")
     default_subject = f"【{name}】ご回答を受け付けました" if name else DEFAULT_AUTO_SUBJECT
     auto_reply_subject = st.text_input("自動返信メール 件名", value=default_subject if is_new else conf["auto_reply_subject"] or default_subject, key=f"{key_prefix}_auto_subject")
     st.caption("氏名・学会名・諾否・辞退理由・備考・初回登録情報・回答日時・マイページURLはシステムが自動でメールに追加します。差込タグは不要です。")
@@ -1207,18 +1205,18 @@ def admin_page():
         st.markdown("#### 本番運用について")
         st.warning("現在の保存先はSQLiteなので、Streamlit Community Cloudでは再起動・再デプロイ時にデータが失われる可能性があります。本番回答を開始する前に永続保存へ切り替えてください。")
         st.markdown("新しい学会は、この管理画面で『＋ 新しい学会』→設定→Excel取込だけで追加できます。")
-        st.markdown("招聘状セットなどの質問項目、回答者への自動返信、事務局への回答通知は学会ごとにON/OFFできます。")
+        st.markdown("招聘状セットなどの質問項目は学会ごとに設定できます。回答受付メールは常に回答者へ送信し、同じメールを学会事務局へCCします。")
         st.markdown("#### 共通SMTP設定")
         if smtp_ready():
-            st.success(f"SMTP設定済み：{SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY}")
+            st.success(f"共通SMTP設定済み：{SMTP_FROM_EMAIL} → {SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY}")
         else:
             st.error("SMTP設定が未完了のため、メールは送信されません。Streamlitの Settings → Secrets に下記を設定してください。")
-        st.code('''SMTP_HOST = "mail.example.jp"
-SMTP_PORT = "587"
-SMTP_USERNAME = "your-account@example.jp"
-SMTP_PASSWORD = "メール送信用パスワード"
+        st.code('''SMTP_HOST = "smtp.gakkai.co.jp"
+SMTP_PORT = 587
+SMTP_USERNAME = "quo@gakkai.co.jp"
+SMTP_PASSWORD = "ここに送信用アカウントのパスワード"
 SMTP_SECURITY = "starttls"
-SMTP_FROM_EMAIL = "your-account@example.jp"''', language="toml")
+SMTP_FROM_EMAIL = "quo@gakkai.co.jp"''', language="toml")
         st.caption("SMTP_SECURITY は starttls / ssl / none のいずれか。メールアカウントの仕様に合わせて設定します。")
         test_to = st.text_input("テスト送信先メールアドレス", key="smtp_test_to")
         if st.button("SMTPテストメールを送信", disabled=not smtp_ready(), key="smtp_test_btn"):

@@ -575,7 +575,7 @@ def render_mail_template(template, values):
     return (template or "").format_map(SafeDict(values))
 
 
-def send_email_message(to_email, subject, body, sender_name="", reply_to="", bcc_email=""):
+def send_email_message(to_email, subject, body, sender_name="", reply_to="", cc_email=""):
     if not smtp_ready():
         raise RuntimeError("SMTP設定が未完了です。管理画面の『運用設定』をご確認ください。")
     if not to_email:
@@ -586,8 +586,8 @@ def send_email_message(to_email, subject, body, sender_name="", reply_to="", bcc
     msg["To"] = to_email
     if reply_to:
         msg["Reply-To"] = reply_to
-    if bcc_email:
-        msg["Bcc"] = bcc_email
+    if cc_email:
+        msg["Cc"] = cc_email
     msg.set_content(body)
     if SMTP_SECURITY == "ssl":
         context = ssl.create_default_context()
@@ -701,9 +701,9 @@ def send_response_notifications(conf, token, submitted_rows, answers_map, note, 
         results.append(("warning", "回答は保存されましたが、回答者のメールアドレスがないため自動返信メールを送信できませんでした。"))
         return results
     try:
-        send_email_message(email, subject, body, sender_name, reply_to, bcc_email=office)
+        send_email_message(email, subject, body, sender_name, reply_to, cc_email=office)
         if office:
-            results.append(("success", f"自動返信メールを {email} に送信し、同じ内容を事務局（{office}）へBCC送信しました。"))
+            results.append(("success", f"自動返信メールを {email} に送信し、同じ内容を事務局（{office}）へCC送信しました。"))
         else:
             results.append(("success", f"自動返信メールを {email} に送信しました。"))
     except Exception as e:
@@ -1042,7 +1042,7 @@ def conference_settings_form(conf=None, key_prefix="conf"):
 
     st.markdown("#### 回答受付メール")
     st.caption("回答登録時は、回答者へ自動返信し、同じメールを運営事務局へBCC送信します。ON/OFF設定はありません。")
-    reply_to_email = st.text_input("運営事務局メールアドレス（Reply-To・BCC先）", value="" if is_new else (conf["reply_to_email"] or conf["office_email"] or ""), placeholder="例：jsrr17@gakkai.co.jp", key=f"{key_prefix}_reply_to")
+    reply_to_email = st.text_input("運営事務局メールアドレス（Reply-To・CC先）", value="" if is_new else (conf["reply_to_email"] or conf["office_email"] or ""), placeholder="例：jsrr17@gakkai.co.jp", key=f"{key_prefix}_reply_to")
     if is_new:
         sender_name_default = (name + " 運営事務局") if name else "運営事務局"
     else:

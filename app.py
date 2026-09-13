@@ -232,6 +232,17 @@ def update_conference(cid, values):
         ))
 
 
+
+def delete_conference(cid):
+    """Delete one conference and all related local data."""
+    with connect() as con:
+        # Delete children first because foreign-key cascading is not assumed.
+        con.execute("DELETE FROM responses WHERE conference_id=?", (cid,))
+        con.execute("DELETE FROM requests WHERE conference_id=?", (cid,))
+        con.execute("DELETE FROM people WHERE conference_id=?", (cid,))
+        con.execute("DELETE FROM conferences WHERE id=?", (cid,))
+        con.commit()
+
 def excel_col(n):
     s = ""
     n += 1
@@ -779,6 +790,27 @@ def admin_page():
                 values=conference_settings_form(conf, key_prefix=f"edit_{conf['id']}")
                 if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):
                     update_conference(conf['id'],values); st.success("保存しました。"); st.rerun()
+
+                st.divider()
+                with st.expander("⚠ この学会を削除", expanded=False):
+                    st.warning("この操作は取り消せません。この学会に紐づく先生情報・依頼・回答もすべて削除します。")
+                    confirm_code = st.text_input(
+                        f"確認のため学会コード「{conf['code']}」を入力してください",
+                        key=f"delete_code_{conf['id']}"
+                    )
+                    delete_ok = confirm_code.strip() == conf['code']
+                    if st.button(
+                        "この学会を完全に削除",
+                        type="secondary",
+                        disabled=not delete_ok,
+                        key=f"delete_conf_{conf['id']}",
+                        use_container_width=True,
+                    ):
+                        deleted_name = conf['name']
+                        deleted_code = conf['code']
+                        delete_conference(conf['id'])
+                        st.success(f"{deleted_code}｜{deleted_name} を削除しました。")
+                        st.rerun()
             with subtabs[4]:
                 ps=[]
                 for p in all_people(conf['id']):
@@ -787,7 +819,7 @@ def admin_page():
 
     with tabs[3]:
         st.markdown("#### 本番運用について")
-        st.warning("この v3.0 は『複数学会を1アプリで管理する共通版』です。現在の保存先はSQLiteなので、Streamlit Community Cloudでは再起動・再デプロイ時にデータが失われる可能性があります。本番回答を開始する前に、次版で永続保存（Google Sheets等）へ切り替えます。")
+        st.warning("この v3.2 は『複数学会を1アプリで管理する共通版』です。現在の保存先はSQLiteなので、Streamlit Community Cloudでは再起動・再デプロイ時にデータが失われる可能性があります。本番回答を開始する前に、次版で永続保存（Google Sheets等）へ切り替えます。")
         st.markdown("新しい学会を追加するときは、今後 **GitHubやStreamlitで新アプリを作る必要はありません**。この管理画面で『＋ 新しい学会』→設定→Excel取込だけで追加します。")
         st.markdown("招聘状セットは学会設定ごとにON/OFFできます。JKRA17のみON、他学会はOFFにできます。")
 

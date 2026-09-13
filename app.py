@@ -678,24 +678,24 @@ def make_export(conf):
     return out.getvalue()
 
 
-def conference_settings_form(conf=None):
+def conference_settings_form(conf=None, key_prefix="conf"):
     is_new = conf is None
-    code = st.text_input("学会コード（英数字・ハイフン）", value="" if is_new else conf["code"], disabled=not is_new, placeholder="例：JKRA17")
-    name = st.text_input("学会名", value="" if is_new else conf["name"])
-    dates = st.text_input("会期", value="" if is_new else conf["dates"] or "", placeholder="例：2027年3月20日（土）・21日（日）")
-    venue = st.text_input("会場", value="" if is_new else conf["venue"] or "")
-    deadline = st.text_input("標準回答期限", value="" if is_new else conf["reply_deadline"] or "")
-    active = st.checkbox("回答ページを有効にする", value=True if is_new else bool(conf["active"]))
+    code = st.text_input("学会コード（英数字・ハイフン）", value="" if is_new else conf["code"], disabled=not is_new, placeholder="例：JKRA17", key=f"{key_prefix}_code")
+    name = st.text_input("学会名", value="" if is_new else conf["name"], key=f"{key_prefix}_name")
+    dates = st.text_input("会期", value="" if is_new else conf["dates"] or "", placeholder="例：2027年3月20日（土）・21日（日）", key=f"{key_prefix}_dates")
+    venue = st.text_input("会場", value="" if is_new else conf["venue"] or "", key=f"{key_prefix}_venue")
+    deadline = st.text_input("標準回答期限", value="" if is_new else conf["reply_deadline"] or "", key=f"{key_prefix}_deadline")
+    active = st.checkbox("回答ページを有効にする", value=True if is_new else bool(conf["active"]), key=f"{key_prefix}_active")
     st.markdown("#### 初回だけ聞く項目")
     c1,c2,c3 = st.columns(3)
-    ask_furigana = c1.checkbox("ふりがな", value=True if is_new else bool(conf["ask_furigana"]))
-    ask_membership = c2.checkbox("会員区分", value=False if is_new else bool(conf["ask_membership"]))
-    ask_mobile = c3.checkbox("緊急連絡先", value=False if is_new else bool(conf["ask_mobile"]))
-    ask_correction = st.checkbox("氏名・所属等の修正依頼", value=True if is_new else bool(conf["ask_correction"]))
-    membership_label = st.text_input("会員区分の表示名", value="会員・非会員" if is_new else conf["membership_label"] or "会員・非会員", disabled=not ask_membership)
+    ask_furigana = c1.checkbox("ふりがな", value=True if is_new else bool(conf["ask_furigana"]), key=f"{key_prefix}_furigana")
+    ask_membership = c2.checkbox("会員区分", value=False if is_new else bool(conf["ask_membership"]), key=f"{key_prefix}_membership")
+    ask_mobile = c3.checkbox("緊急連絡先", value=False if is_new else bool(conf["ask_mobile"]), key=f"{key_prefix}_mobile")
+    ask_correction = st.checkbox("氏名・所属等の修正依頼", value=True if is_new else bool(conf["ask_correction"]), key=f"{key_prefix}_correction")
+    membership_label = st.text_input("会員区分の表示名", value="会員・非会員" if is_new else conf["membership_label"] or "会員・非会員", disabled=not ask_membership, key=f"{key_prefix}_membership_label")
     st.markdown("#### 学会固有の追加項目")
-    invitation_enabled = st.checkbox("招聘状／派遣依頼状セットを使う", value=False if is_new else bool(conf["invitation_enabled"]))
-    invitation_label = st.text_input("表示名", value="派遣依頼状（招聘状）の発行について" if is_new else conf["invitation_label"] or "派遣依頼状（招聘状）の発行について", disabled=not invitation_enabled)
+    invitation_enabled = st.checkbox("招聘状／派遣依頼状セットを使う", value=False if is_new else bool(conf["invitation_enabled"]), key=f"{key_prefix}_invitation_enabled")
+    invitation_label = st.text_input("表示名", value="派遣依頼状（招聘状）の発行について" if is_new else conf["invitation_label"] or "派遣依頼状（招聘状）の発行について", disabled=not invitation_enabled, key=f"{key_prefix}_invitation_label")
     values = {"code":code.strip(),"name":name.strip(),"dates":dates.strip(),"venue":venue.strip(),"reply_deadline":deadline.strip(),"active":active,
               "ask_furigana":ask_furigana,"ask_membership":ask_membership,"membership_label":membership_label.strip(),"ask_mobile":ask_mobile,
               "ask_correction":ask_correction,"invitation_enabled":invitation_enabled,"invitation_label":invitation_label.strip()}
@@ -711,7 +711,7 @@ def admin_page():
     if not st.session_state.get("admin_ok"):
         pw = st.text_input("管理者パスワード", type="password")
         if st.button("ログイン", type="primary"):
-            if hmac.compare_digest(pw, ADMIN_PASSWORD):
+            if hmac.compare_digest(pw.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
                 st.session_state.admin_ok=True; st.rerun()
             else: st.error("パスワードが違います。")
         return
@@ -729,7 +729,7 @@ def admin_page():
             st.dataframe(data,use_container_width=True,hide_index=True)
 
     with tabs[1]:
-        values=conference_settings_form()
+        values=conference_settings_form(key_prefix="new_conf")
         if st.button("この学会を作成",type="primary",use_container_width=True):
             if not values['code'] or not re.fullmatch(r"[A-Za-z0-9_-]+",values['code']): st.error("学会コードは半角英数字・_・-で入力してください。")
             elif not values['name']: st.error("学会名を入力してください。")
@@ -776,7 +776,7 @@ def admin_page():
                         urls.append({"氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],"専用URL":f"{BASE_URL}/?c={conf['code']}&token={r['token']}"})
                 st.dataframe(urls,use_container_width=True,hide_index=True)
             with subtabs[3]:
-                values=conference_settings_form(conf)
+                values=conference_settings_form(conf, key_prefix=f"edit_{conf['id']}")
                 if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):
                     update_conference(conf['id'],values); st.success("保存しました。"); st.rerun()
             with subtabs[4]:

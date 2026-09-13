@@ -4,6 +4,9 @@ import sqlite3
 import hashlib
 import hmac
 import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, date
@@ -12,7 +15,7 @@ import streamlit as st
 from python_calamine import CalamineWorkbook
 import xlsxwriter
 
-APP_NAME = "登壇諾否マイページ｜共通管理版"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v3.6"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -26,6 +29,14 @@ def get_secret(name, default=""):
 
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "")
 TOKEN_SECRET = get_secret("TOKEN_SECRET", "local-development-secret").encode("utf-8")
+
+# 共通メール送信設定（Streamlit Secretsで1回だけ設定）
+SMTP_HOST = get_secret("SMTP_HOST", "").strip()
+SMTP_PORT = int(get_secret("SMTP_PORT", "587") or 587)
+SMTP_USERNAME = get_secret("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = get_secret("SMTP_PASSWORD", "")
+SMTP_SECURITY = get_secret("SMTP_SECURITY", "starttls").strip().lower()  # starttls / ssl / none
+SMTP_FROM_EMAIL = get_secret("SMTP_FROM_EMAIL", SMTP_USERNAME).strip()
 
 def get_base_url():
     """Return the actual app URL automatically.
@@ -133,6 +144,15 @@ def init_db():
             ask_correction INTEGER NOT NULL DEFAULT 1,
             invitation_enabled INTEGER NOT NULL DEFAULT 0,
             invitation_label TEXT,
+            auto_reply_enabled INTEGER NOT NULL DEFAULT 1,
+            office_notify_enabled INTEGER NOT NULL DEFAULT 1,
+            office_email TEXT,
+            sender_name TEXT,
+            reply_to_email TEXT,
+            auto_reply_subject TEXT,
+            auto_reply_body TEXT,
+            office_subject TEXT,
+            office_body TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS people (
@@ -188,6 +208,22 @@ def init_db():
             FOREIGN KEY(conference_id) REFERENCES conferences(id)
         );
         """)
+        # 既存DBをv3.5へ自動移行
+        cols = {r[1] for r in con.execute("PRAGMA table_info(conferences)").fetchall()}
+        additions = {
+            "auto_reply_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "office_notify_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "office_email": "TEXT",
+            "sender_name": "TEXT",
+            "reply_to_email": "TEXT",
+            "auto_reply_subject": "TEXT",
+            "auto_reply_body": "TEXT",
+            "office_subject": "TEXT",
+            "office_body": "TEXT",
+        }
+        for col, ddl in additions.items():
+            if col not in cols:
+                con.execute(f"ALTER TABLE conferences ADD COLUMN {col} {ddl}")
 
 
 def hero(title, text=""):
@@ -229,13 +265,18 @@ def create_conference(values):
     with connect() as con:
         con.execute("""
         INSERT INTO conferences(code,name,dates,venue,reply_deadline,active,ask_furigana,ask_membership,membership_label,
-                                ask_mobile,ask_correction,invitation_enabled,invitation_label,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                ask_mobile,ask_correction,invitation_enabled,invitation_label,
+                                auto_reply_enabled,office_notify_enabled,office_email,sender_name,reply_to_email,
+                                auto_reply_subject,auto_reply_body,office_subject,office_body,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             values["code"], values["name"], values.get("dates", ""), values.get("venue", ""), values.get("reply_deadline", ""),
             1, bool_int(values.get("ask_furigana")), bool_int(values.get("ask_membership")), values.get("membership_label", ""),
             bool_int(values.get("ask_mobile")), bool_int(values.get("ask_correction")), bool_int(values.get("invitation_enabled")),
-            values.get("invitation_label", ""), now
+            values.get("invitation_label", ""), bool_int(values.get("auto_reply_enabled", True)),
+            bool_int(values.get("office_notify_enabled", True)), values.get("office_email", ""), values.get("sender_name", ""),
+            values.get("reply_to_email", ""), values.get("auto_reply_subject", ""), values.get("auto_reply_body", ""),
+            values.get("office_subject", ""), values.get("office_body", ""), now
         ))
 
 
@@ -243,12 +284,17 @@ def update_conference(cid, values):
     with connect() as con:
         con.execute("""
         UPDATE conferences SET name=?,dates=?,venue=?,reply_deadline=?,active=?,ask_furigana=?,ask_membership=?,membership_label=?,
-            ask_mobile=?,ask_correction=?,invitation_enabled=?,invitation_label=? WHERE id=?
+            ask_mobile=?,ask_correction=?,invitation_enabled=?,invitation_label=?,
+            auto_reply_enabled=?,office_notify_enabled=?,office_email=?,sender_name=?,reply_to_email=?,
+            auto_reply_subject=?,auto_reply_body=?,office_subject=?,office_body=? WHERE id=?
         """, (
             values["name"], values.get("dates", ""), values.get("venue", ""), values.get("reply_deadline", ""), bool_int(values.get("active")),
             bool_int(values.get("ask_furigana")), bool_int(values.get("ask_membership")), values.get("membership_label", ""),
             bool_int(values.get("ask_mobile")), bool_int(values.get("ask_correction")), bool_int(values.get("invitation_enabled")),
-            values.get("invitation_label", ""), cid
+            values.get("invitation_label", ""), bool_int(values.get("auto_reply_enabled", True)),
+            bool_int(values.get("office_notify_enabled", True)), values.get("office_email", ""), values.get("sender_name", ""),
+            values.get("reply_to_email", ""), values.get("auto_reply_subject", ""), values.get("auto_reply_body", ""),
+            values.get("office_subject", ""), values.get("office_body", ""), cid
         ))
 
 
@@ -505,6 +551,183 @@ def save_response(conf_id, request_id_value, answer, decline_reason, note):
         """, (request_id_value, conf_id, answer, clean(decline_reason), clean(note), datetime.now().isoformat(timespec="seconds")))
 
 
+DEFAULT_AUTO_SUBJECT = "【回答受付】登壇諾否のご回答ありがとうございます"
+DEFAULT_AUTO_INTRO = """※本メールはご登録いただいたメールアドレスへ自動送信しております。
+
+この度は、指定演題ご依頼の諾否につきまして、ご回答を賜り誠にありがとうございます。
+下記の通り、ご回答を受け付けいたしました。
+
+＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+ご登録内容の変更について
+＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+本メールの返信にてご連絡ください。
+"""
+
+
+def smtp_ready():
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_FROM_EMAIL)
+
+
+def render_mail_template(template, values):
+    class SafeDict(dict):
+        def __missing__(self, key):
+            return "{" + key + "}"
+    return (template or "").format_map(SafeDict(values))
+
+
+def send_email_message(to_email, subject, body, sender_name="", reply_to="", bcc_email=""):
+    if not smtp_ready():
+        raise RuntimeError("SMTP設定が未完了です。管理画面の『運用設定』をご確認ください。")
+    if not to_email:
+        raise RuntimeError("送信先メールアドレスが空です。")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{sender_name} <{SMTP_FROM_EMAIL}>" if sender_name else SMTP_FROM_EMAIL
+    msg["To"] = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if bcc_email:
+        msg["Bcc"] = bcc_email
+    msg.set_content(body)
+    if SMTP_SECURITY == "ssl":
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.ehlo()
+            if SMTP_SECURITY == "starttls":
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+
+def send_response_notifications(conf, token, submitted_rows, answers_map, note, profile, first_registration=False, decline_map=None):
+    """Send one automatic receipt email to the respondent and BCC the office.
+
+    The administrator edits only the plain subject and introductory text.  All
+    response/profile details below are generated automatically, so no merge
+    tags are required.
+    """
+    now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    decline_map = decline_map or {}
+    name = (profile["name"] if profile else submitted_rows[0]["name"]) or ""
+    email = (profile["email"] if profile else submitted_rows[0]["email"]) or ""
+    affiliation = (profile["affiliation"] if profile else submitted_rows[0]["affiliation"]) or ""
+
+    answer_lines = []
+    for r in submitted_rows:
+        ans = answers_map.get(r["request_id"], "")
+        label = "承諾" if ans == "諾" else "辞退" if ans == "否" else ans
+        answer_lines.extend([
+            f"セッション：{r['session_name'] or ''}",
+            f"役割：{r['role'] or ''}",
+            f"回答：{label}",
+        ])
+        if r["theme"]:
+            answer_lines.append(f"テーマ：{r['theme']}")
+        if r["schedule"]:
+            answer_lines.append(f"日時：{r['schedule']}")
+        reason = clean(decline_map.get(r["request_id"], ""))
+        if ans == "否" and reason:
+            answer_lines.append(f"辞退理由：{reason}")
+        answer_lines.append("")
+
+    registration_lines = []
+    if first_registration and profile:
+        registration_lines.extend([
+            "＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝",
+            "ご登録情報",
+            "＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝",
+            f"氏名：{profile['name'] or ''}",
+            f"所属：{profile['affiliation'] or ''}",
+            f"メールアドレス：{profile['email'] or ''}",
+        ])
+        if conf["ask_furigana"]:
+            registration_lines.append(f"ふりがな：{profile['furigana'] or ''}")
+        if conf["ask_membership"]:
+            registration_lines.append(f"{conf['membership_label'] or '会員区分'}：{profile['membership'] or ''}")
+        if conf["ask_mobile"]:
+            registration_lines.append(f"緊急連絡先：{profile['mobile'] or ''}")
+        if conf["ask_correction"]:
+            registration_lines.append(f"氏名・所属等の修正依頼：{profile['correction'] or 'なし'}")
+        if conf["invitation_enabled"]:
+            registration_lines.append(f"{conf['invitation_label'] or '招聘状・派遣依頼状'}：{profile['invitation'] or ''}")
+            if profile["invitation"] == "必要":
+                registration_lines.extend([
+                    f"所属長の所属機関名：{profile['leader_org'] or ''}",
+                    f"所属長の役職：{profile['leader_title'] or ''}",
+                    f"所属長の氏名：{profile['leader_name'] or ''}",
+                    f"指定様式・web申請等：{profile['special_request'] or 'なし'}",
+                ])
+        registration_lines.append("")
+
+    intro = (conf["auto_reply_body"] or DEFAULT_AUTO_INTRO).strip()
+    subject = (conf["auto_reply_subject"] or DEFAULT_AUTO_SUBJECT).strip()
+    # No merge syntax is required. Conference/name are added automatically.
+    body_parts = [
+        "※本メールはご登録いただいたメールアドレスへ自動送信しております。",
+        "",
+        f"{name} 先生",
+        "",
+        intro.replace("※本メールはご登録いただいたメールアドレスへ自動送信しております。", "").strip(),
+        "",
+        f"運営事務局：{conf['name']}",
+        f"E-mail：{conf['reply_to_email'] or conf['office_email'] or ''}",
+        "",
+        "＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝",
+        "今回のご回答内容",
+        "＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝",
+        *answer_lines,
+        f"備考：{note or 'なし'}",
+        "",
+        *registration_lines,
+        "回答日時：" + now,
+        "",
+        "ご登録内容・これまでの回答は、下記マイページよりご確認いただけます。",
+        person_url(conf["code"], token),
+    ]
+    body = "\n".join(body_parts).strip() + "\n"
+
+    sender_name = conf["sender_name"] or f"{conf['name']} 運営事務局"
+    reply_to = conf["reply_to_email"] or conf["office_email"] or ""
+    office = reply_to
+    results = []
+    if not email:
+        results.append(("warning", "回答は保存されましたが、回答者のメールアドレスがないため自動返信メールを送信できませんでした。"))
+        return results
+    try:
+        send_email_message(email, subject, body, sender_name, reply_to, bcc_email=office)
+        if office:
+            results.append(("success", f"自動返信メールを {email} に送信し、同じ内容を事務局（{office}）へBCC送信しました。"))
+        else:
+            results.append(("success", f"自動返信メールを {email} に送信しました。"))
+    except Exception as e:
+        results.append(("warning", f"回答は保存されましたが、メールを送信できませんでした：{e}"))
+    return results
+
+
+def set_flash(messages):
+    st.session_state["response_flash"] = messages
+
+
+def show_flash():
+    messages = st.session_state.pop("response_flash", None)
+    if not messages:
+        return
+    for kind, text in messages:
+        if kind == "success":
+            st.success(text)
+        elif kind == "warning":
+            st.warning(text)
+        else:
+            st.info(text)
+
+
 def save_upload(conf_code, token, upload):
     if not upload:
         return "", ""
@@ -628,10 +851,14 @@ def initial_form(conf, token, rows, pending):
         "leader_name": leader_name.strip(), "special_request": special_request.strip(), "upload_name": upload_name, "upload_path": upload_path,
         "registered_at": datetime.now().isoformat(timespec="seconds"), "source": "system"
     }, overwrite=True)
+    saved_answers = {}
     for r in pending:
         ans = "諾" if answers[r["request_id"]] == "承諾する" else "否"
         save_response(conf["id"], r["request_id"], ans, declines[r["request_id"]], note)
-    st.success("回答を登録しました。次回以降は、諾否と備考のみご回答いただけます。")
+        saved_answers[r["request_id"]] = ans
+    profile = get_profile(conf["id"], token)
+    mails = send_response_notifications(conf, token, pending, saved_answers, note, profile, first_registration=True, decline_map=declines)
+    set_flash([("success", "回答を登録しました。次回以降は、諾否と備考のみご回答いただけます。"), *mails])
     st.rerun()
 
 
@@ -653,10 +880,13 @@ def subsequent_form(conf, p, rows, pending):
                 if any(answers[r["request_id"]] == "選択してください" for r in pending):
                     st.error("すべてのご依頼について、承諾または辞退を選択してください。")
                     return
+                saved_answers = {}
                 for r in pending:
                     ans = "諾" if answers[r["request_id"]] == "承諾する" else "否"
                     save_response(conf["id"], r["request_id"], ans, declines[r["request_id"]], note)
-                st.success("回答を登録しました。")
+                    saved_answers[r["request_id"]] = ans
+                mails = send_response_notifications(conf, p["token"], pending, saved_answers, note, p, first_registration=False, decline_map=declines)
+                set_flash([("success", "回答を登録しました。"), *mails])
                 st.rerun()
     else:
         st.success("現在、新たにご回答いただく依頼はありません。")
@@ -677,6 +907,7 @@ def user_page(conf_code, token):
         return
     hero(conf["name"], f"{conf['dates'] or ''}　{conf['venue'] or ''}")
     st.markdown(f'<div class="person">{rows[0]["name"]} 先生</div><div class="subtle">{rows[0]["affiliation"]}</div>', unsafe_allow_html=True)
+    show_flash()
     pending = [r for r in rows if not effective_answer(r)]
     done = [r for r in rows if effective_answer(r)]
     p = get_profile(conf["id"], token)
@@ -767,6 +998,29 @@ def make_url_export(conf, mode="all"):
     return out.getvalue(), len(selected)
 
 
+def make_reminder_export(conf):
+    rows = all_rows(conf["id"])
+    grouped = {}
+    for r in rows:
+        if effective_answer(r):
+            continue
+        g = grouped.setdefault(r["token"], {"name":r["name"],"affiliation":r["affiliation"],"email":r["email"],"items":[]})
+        g["items"].append(f"{r['session_name']}｜{r['role']}")
+    out = BytesIO(); book = xlsxwriter.Workbook(out, {"in_memory": True}); ws = book.add_worksheet("催促メール用")
+    head = book.add_format({"bold":True,"bg_color":"#1E526D","font_color":"#FFFFFF","border":1})
+    headers=["氏名","所属","メールアドレス","未回答依頼","専用URL","件名","メール本文"]
+    for c,h in enumerate(headers): ws.write(0,c,h,head)
+    for rn,(token,g) in enumerate(grouped.items(),1):
+        items="／".join(g["items"])
+        subject=f"【ご回答のお願い】{conf['name']} 登壇諾否について"
+        body=f"{g['name']} 先生\n\nお世話になっております。\n{conf['name']} 運営事務局でございます。\n\n下記ご依頼につきまして、現在ご回答を確認できておりません。\n{items}\n\n恐れ入りますが、下記専用ページよりご回答くださいますようお願い申し上げます。\n{person_url(conf['code'],token)}\n\n何卒よろしくお願い申し上げます。"
+        vals=[g["name"],g["affiliation"],g["email"],items,person_url(conf["code"],token),subject,body]
+        for c,v in enumerate(vals): ws.write(rn,c,v)
+    ws.set_column(0,2,28); ws.set_column(3,3,48); ws.set_column(4,4,58); ws.set_column(5,5,42); ws.set_column(6,6,80)
+    ws.freeze_panes(1,0); book.close(); out.seek(0)
+    return out.getvalue(), len(grouped)
+
+
 def conference_settings_form(conf=None, key_prefix="conf"):
     is_new = conf is None
     code = st.text_input("学会コード（英数字・ハイフン）", value="" if is_new else conf["code"], disabled=not is_new, placeholder="例：JKRA17", key=f"{key_prefix}_code")
@@ -785,9 +1039,21 @@ def conference_settings_form(conf=None, key_prefix="conf"):
     st.markdown("#### 学会固有の追加項目")
     invitation_enabled = st.checkbox("招聘状／派遣依頼状セットを使う", value=False if is_new else bool(conf["invitation_enabled"]), key=f"{key_prefix}_invitation_enabled")
     invitation_label = st.text_input("表示名", value="派遣依頼状（招聘状）の発行について" if is_new else conf["invitation_label"] or "派遣依頼状（招聘状）の発行について", disabled=not invitation_enabled, key=f"{key_prefix}_invitation_label")
+
+    st.markdown("#### 回答受付メール")
+    st.caption("回答登録時は、回答者へ自動返信し、同じメールを運営事務局へBCC送信します。ON/OFF設定はありません。")
+    reply_to_email = st.text_input("運営事務局メールアドレス（Reply-To・BCC先）", value="" if is_new else (conf["reply_to_email"] or conf["office_email"] or ""), placeholder="例：jsrr17@gakkai.co.jp", key=f"{key_prefix}_reply_to")
+    sender_name = st.text_input("メール差出人表示名", value=(name + " 運営事務局") if is_new and name else (conf["sender_name"] or (name + " 運営事務局")), key=f"{key_prefix}_sender_name")
+    default_subject = f"【{name}】ご回答を受け付けました" if name else DEFAULT_AUTO_SUBJECT
+    auto_reply_subject = st.text_input("自動返信メール 件名", value=default_subject if is_new else conf["auto_reply_subject"] or default_subject, key=f"{key_prefix}_auto_subject")
+    st.caption("氏名・学会名・諾否・辞退理由・備考・初回登録情報・回答日時・マイページURLはシステムが自動でメールに追加します。差込タグは不要です。")
+    auto_reply_body = st.text_area("回答内容より前に表示する案内文", value=DEFAULT_AUTO_INTRO if is_new else conf["auto_reply_body"] or DEFAULT_AUTO_INTRO, height=260, key=f"{key_prefix}_auto_body")
     values = {"code":code.strip(),"name":name.strip(),"dates":dates.strip(),"venue":venue.strip(),"reply_deadline":deadline.strip(),"active":active,
               "ask_furigana":ask_furigana,"ask_membership":ask_membership,"membership_label":membership_label.strip(),"ask_mobile":ask_mobile,
-              "ask_correction":ask_correction,"invitation_enabled":invitation_enabled,"invitation_label":invitation_label.strip()}
+              "ask_correction":ask_correction,"invitation_enabled":invitation_enabled,"invitation_label":invitation_label.strip(),
+              "auto_reply_enabled":True,"office_notify_enabled":True,"office_email":reply_to_email.strip(),
+              "sender_name":sender_name.strip(),"reply_to_email":reply_to_email.strip(),"auto_reply_subject":auto_reply_subject,
+              "auto_reply_body":auto_reply_body,"office_subject":"","office_body":""}
     return values
 
 
@@ -896,6 +1162,12 @@ def admin_page():
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True, key=f"url_add_{conf['id']}"
                     )
+                    reminder_data, reminder_count = make_reminder_export(conf)
+                    st.download_button(
+                        f"未回答者 催促メール用Excel（{reminder_count}名）", reminder_data, f"{conf['code']}_未回答者_催促メール用.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key=f"reminder_{conf['id']}"
+                    )
             with subtabs[3]:
                 values=conference_settings_form(conf, key_prefix=f"edit_{conf['id']}")
                 if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):
@@ -929,9 +1201,28 @@ def admin_page():
 
     with tabs[3]:
         st.markdown("#### 本番運用について")
-        st.warning("この v3.2 は『複数学会を1アプリで管理する共通版』です。現在の保存先はSQLiteなので、Streamlit Community Cloudでは再起動・再デプロイ時にデータが失われる可能性があります。本番回答を開始する前に、次版で永続保存（Google Sheets等）へ切り替えます。")
-        st.markdown("新しい学会を追加するときは、今後 **GitHubやStreamlitで新アプリを作る必要はありません**。この管理画面で『＋ 新しい学会』→設定→Excel取込だけで追加します。")
-        st.markdown("招聘状セットは学会設定ごとにON/OFFできます。JKRA17のみON、他学会はOFFにできます。")
+        st.warning("現在の保存先はSQLiteなので、Streamlit Community Cloudでは再起動・再デプロイ時にデータが失われる可能性があります。本番回答を開始する前に永続保存へ切り替えてください。")
+        st.markdown("新しい学会は、この管理画面で『＋ 新しい学会』→設定→Excel取込だけで追加できます。")
+        st.markdown("招聘状セットなどの質問項目、回答者への自動返信、事務局への回答通知は学会ごとにON/OFFできます。")
+        st.markdown("#### 共通SMTP設定")
+        if smtp_ready():
+            st.success(f"SMTP設定済み：{SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY}")
+        else:
+            st.error("SMTP設定が未完了のため、メールは送信されません。Streamlitの Settings → Secrets に下記を設定してください。")
+        st.code('''SMTP_HOST = "mail.example.jp"
+SMTP_PORT = "587"
+SMTP_USERNAME = "your-account@example.jp"
+SMTP_PASSWORD = "メール送信用パスワード"
+SMTP_SECURITY = "starttls"
+SMTP_FROM_EMAIL = "your-account@example.jp"''', language="toml")
+        st.caption("SMTP_SECURITY は starttls / ssl / none のいずれか。メールアカウントの仕様に合わせて設定します。")
+        test_to = st.text_input("テスト送信先メールアドレス", key="smtp_test_to")
+        if st.button("SMTPテストメールを送信", disabled=not smtp_ready(), key="smtp_test_btn"):
+            try:
+                send_email_message(test_to.strip(), "【テスト】登壇諾否マイページ メール送信確認", "このメールが届けば、SMTP設定は正常です。", "登壇諾否マイページ")
+                st.success(f"テストメールを {test_to.strip()} に送信しました。")
+            except Exception as e:
+                st.error(f"テストメールを送信できませんでした：{e}")
 
 
 init_db()

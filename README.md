@@ -1,25 +1,24 @@
-# 登壇諾否マイページ 共通管理版 v3.9
+# 登壇諾否マイページ 共通管理版 v4.0
 
-## v3.9のメール仕様
-- 送信元SMTPアカウントはシステム全体で1つだけ設定します。
-- 学会ごとにSMTPアカウントやパスワードを設定する必要はありません。
-- 回答時は、回答者を To、学会事務局を CC、Reply-To も学会事務局にして同一メールを送信します。
-- 学会ごとに設定するメール項目は「運営事務局メールアドレス」「件名」「回答内容より前の案内文」です。
-- 差出人表示名は「＜学会名＞ 運営事務局」として自動生成されます。
-- 回答内容、備考、初回登録情報、回答日時、マイページURLはシステムが自動生成します。差込タグは不要です。
-- 未回答者へのリマインド送信は行いません。先生別URL・未回答者一覧をExcel出力し、既存のVBA送信で利用します。
+## SMTP互換対応
+Shurikenの既存設定に合わせて、587 + STARTTLS + SMTP AUTH に対応しています。
 
-## Streamlit Secrets（共通で1回のみ）
+今回の設定例：
+
 ```toml
-ADMIN_PASSWORD = "管理画面用パスワード"
-TOKEN_SECRET = "十分に長いランダム文字列"
-
-SMTP_HOST = "smtp.gakkai.co.jp"
+SMTP_HOST = "211.13.204.15"
 SMTP_PORT = 587
-SMTP_USERNAME = "quo@gakkai.co.jp"
-SMTP_PASSWORD = "送信用アカウントのパスワード"
+SMTP_USERNAME = "送信元アカウントのユーザー名"
+SMTP_PASSWORD = "送信元アカウントのパスワード"
 SMTP_SECURITY = "starttls"
-SMTP_FROM_EMAIL = "quo@gakkai.co.jp"
+SMTP_FROM_EMAIL = "送信元メールアドレス"
+SMTP_TLS_VERIFY = false
 ```
 
-※ SMTPパスワードはGitHubへ書かず、Streamlit Community Cloud の Settings → Secrets にのみ保存してください。
+`SMTP_TLS_VERIFY=false` は、IPアドレス接続時に証明書のホスト名が一致しない既存SMTPサーバー向けの互換設定です。通常のSMTPでは true を推奨します。
+
+メール送信仕様：
+- To: 回答者本人
+- CC: 学会ごとの事務局メールアドレス
+- Reply-To: 学会ごとの事務局メールアドレス
+- From: 共通SMTP送信元

@@ -15,7 +15,7 @@ import streamlit as st
 from python_calamine import CalamineWorkbook
 import xlsxwriter
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v3.9"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.0"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -37,6 +37,7 @@ SMTP_USERNAME = get_secret("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = get_secret("SMTP_PASSWORD", "")
 SMTP_SECURITY = get_secret("SMTP_SECURITY", "starttls").strip().lower()  # starttls / ssl / none
 SMTP_FROM_EMAIL = get_secret("SMTP_FROM_EMAIL", SMTP_USERNAME).strip()
+SMTP_TLS_VERIFY = str(get_secret("SMTP_TLS_VERIFY", "true")).strip().lower() not in {"0", "false", "no", "off"}
 
 def get_base_url():
     """Return the actual app URL automatically.
@@ -589,9 +590,16 @@ def send_email_message(to_email, subject, body, sender_name="", reply_to="", cc_
     if cc_email:
         msg["Cc"] = cc_email
     msg.set_content(body)
+    # Shuriken等の既存環境で、IPアドレス接続 + STARTTLS を使いつつ
+    # 証明書のホスト名一致を厳密に検証しない運用に合わせる互換設定。
+    context = ssl.create_default_context()
+    if not SMTP_TLS_VERIFY:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
     if SMTP_SECURITY == "ssl":
-        context = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
+            server.ehlo()
             if SMTP_USERNAME:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.send_message(msg)
@@ -599,7 +607,7 @@ def send_email_message(to_email, subject, body, sender_name="", reply_to="", cc_
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
             server.ehlo()
             if SMTP_SECURITY == "starttls":
-                server.starttls(context=ssl.create_default_context())
+                server.starttls(context=context)
                 server.ehlo()
             if SMTP_USERNAME:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
@@ -1208,23 +1216,29 @@ def admin_page():
         st.markdown("招聘状セットなどの質問項目は学会ごとに設定できます。回答受付メールは常に回答者へ送信し、同じメールを学会事務局へCCします。")
         st.markdown("#### 共通SMTP設定")
         if smtp_ready():
-            st.success(f"共通SMTP設定済み：{SMTP_FROM_EMAIL} → {SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY}")
+            verify_text = "証明書検証ON" if SMTP_TLS_VERIFY else "証明書検証OFF（互換モード）"
+            st.success(f"共通SMTP設定済み：{SMTP_FROM_EMAIL} → {SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY} / {verify_text}")
         else:
             st.error("SMTP設定が未完了のため、メールは送信されません。Streamlitの Settings → Secrets に下記を設定してください。")
-        st.code('''SMTP_HOST = "smtp.gakkai.co.jp"
+        st.code('''SMTP_HOST = "211.13.204.15"
 SMTP_PORT = 587
-SMTP_USERNAME = "quo@gakkai.co.jp"
-SMTP_PASSWORD = "ここに送信用アカウントのパスワード"
+SMTP_USERNAME = "送信元アカウントのユーザー名"
+SMTP_PASSWORD = "送信元アカウントのパスワード"
 SMTP_SECURITY = "starttls"
-SMTP_FROM_EMAIL = "quo@gakkai.co.jp"''', language="toml")
-        st.caption("SMTP_SECURITY は starttls / ssl / none のいずれか。メールアカウントの仕様に合わせて設定します。")
+SMTP_FROM_EMAIL = "送信元メールアドレス"
+SMTP_TLS_VERIFY = false''', language="toml")
+        st.caption("Shurikenの設定に合わせる場合は 587 + STARTTLS。SMTP_TLS_VERIFY=false は、IP接続で証明書名が一致しない既存環境向けの互換設定です。")
         test_to = st.text_input("テスト送信先メールアドレス", key="smtp_test_to")
         if st.button("SMTPテストメールを送信", disabled=not smtp_ready(), key="smtp_test_btn"):
             try:
                 send_email_message(test_to.strip(), "【テスト】登壇諾否マイページ メール送信確認", "このメールが届けば、SMTP設定は正常です。", "登壇諾否マイページ")
                 st.success(f"テストメールを {test_to.strip()} に送信しました。")
             except Exception as e:
-                st.error(f"テストメールを送信できませんでした：{e}")
+                err = str(e)
+                if "535" in err or "authentication failed" in err.lower():
+                    st.error("SMTPサーバーには接続できましたが、認証に失敗しました。SMTP_USERNAME / SMTP_PASSWORD と、Shuriken側の『SMTP認証に受信サーバーのアカウント情報を使う』設定を確認してください。\n\n詳細：" + err)
+                else:
+                    st.error(f"テストメールを送信できませんでした：{err}")
 
 
 init_db()

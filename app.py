@@ -15,7 +15,7 @@ import streamlit as st
 from python_calamine import CalamineWorkbook
 import xlsxwriter
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v3.6"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v3.7"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -1043,7 +1043,11 @@ def conference_settings_form(conf=None, key_prefix="conf"):
     st.markdown("#### 回答受付メール")
     st.caption("回答登録時は、回答者へ自動返信し、同じメールを運営事務局へBCC送信します。ON/OFF設定はありません。")
     reply_to_email = st.text_input("運営事務局メールアドレス（Reply-To・BCC先）", value="" if is_new else (conf["reply_to_email"] or conf["office_email"] or ""), placeholder="例：jsrr17@gakkai.co.jp", key=f"{key_prefix}_reply_to")
-    sender_name = st.text_input("メール差出人表示名", value=(name + " 運営事務局") if is_new and name else (conf["sender_name"] or (name + " 運営事務局")), key=f"{key_prefix}_sender_name")
+    if is_new:
+        sender_name_default = (name + " 運営事務局") if name else "運営事務局"
+    else:
+        sender_name_default = (conf["sender_name"] or ((name + " 運営事務局") if name else "運営事務局"))
+    sender_name = st.text_input("メール差出人表示名", value=sender_name_default, key=f"{key_prefix}_sender_name")
     default_subject = f"【{name}】ご回答を受け付けました" if name else DEFAULT_AUTO_SUBJECT
     auto_reply_subject = st.text_input("自動返信メール 件名", value=default_subject if is_new else conf["auto_reply_subject"] or default_subject, key=f"{key_prefix}_auto_subject")
     st.caption("氏名・学会名・諾否・辞退理由・備考・初回登録情報・回答日時・マイページURLはシステムが自動でメールに追加します。差込タグは不要です。")

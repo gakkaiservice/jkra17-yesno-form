@@ -14,7 +14,6 @@ import xlsxwriter
 
 APP_NAME = "登壇諾否マイページ｜共通管理版"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
-BASE_URL = os.getenv("YESNO_BASE_URL", "http://localhost:8501").rstrip("/")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
 
@@ -27,6 +26,27 @@ def get_secret(name, default=""):
 
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "")
 TOKEN_SECRET = get_secret("TOKEN_SECRET", "local-development-secret").encode("utf-8")
+
+def get_base_url():
+    """Return the actual app URL automatically.
+
+    YESNO_BASE_URL can still override it, but placeholder/example values are ignored.
+    Streamlit 1.46+ exposes the current app URL via st.context.url.
+    """
+    configured = get_secret("YESNO_BASE_URL", "").strip().rstrip("/")
+    if configured and "あなたのURL" not in configured and "your-app" not in configured.lower():
+        return configured
+    try:
+        current = str(st.context.url).strip().rstrip("/")
+        if current:
+            return current
+    except Exception:
+        pass
+    return "http://localhost:8501"
+
+
+def person_url(conf_code, token):
+    return f"{get_base_url()}/?c={conf_code}&token={token}"
 
 st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
 
@@ -539,18 +559,10 @@ def locked_profile(conf, p, row):
 
 def initial_form(conf, token, rows, pending):
     first = rows[0]
-    st.markdown("### 初回ご回答")
-    st.markdown('<div class="notice">初回のみ基本情報をご登録ください。次回以降は基本情報を表示のみとし、諾否と備考だけ回答できます。</div>', unsafe_allow_html=True)
+    st.markdown("### 今回ご回答いただくご依頼")
+    st.markdown('<div class="notice">まず、今回のご依頼について諾否をご回答ください。初回のみ、その下で基本情報をご登録いただきます。</div>', unsafe_allow_html=True)
     for r in pending:
         request_summary_card(r)
-
-    name = st.text_input("氏名", value=first["name"] or "", key="first_name")
-    furigana = st.text_input("ふりがな", key="first_furigana") if conf["ask_furigana"] else ""
-    email = st.text_input("メールアドレス", value=first["email"] or "", key="first_email")
-    membership = ""
-    if conf["ask_membership"]:
-        membership = st.radio(conf["membership_label"] or "会員・非会員", ["選択してください", "会員", "非会員", "入会申請中、入会予定"], key="first_membership")
-    mobile = st.text_input("当日の緊急連絡先（携帯電話番号）", key="first_mobile") if conf["ask_mobile"] else ""
 
     st.markdown("#### 諾否のご回答")
     answers, declines = {}, {}
@@ -558,6 +570,18 @@ def initial_form(conf, token, rows, pending):
         label = f"{r['session_name']}｜{r['role']}"
         answers[r["request_id"]] = st.radio(label, ["選択してください", "承諾する", "辞退する"], horizontal=True, key=f"ans_{r['request_id']}")
         declines[r["request_id"]] = st.text_area(f"辞退理由（{label}）※辞退の場合のみ", key=f"dec_{r['request_id']}")
+
+    note = st.text_area("備考", placeholder="ご連絡事項がございましたら、ご入力ください。", key="first_note")
+
+    st.markdown("### ご登録情報")
+    st.caption("初回のみご登録ください。次回以降は表示のみとなり、変更できません。変更が必要な場合は備考欄にご記入ください。")
+    name = st.text_input("氏名", value=first["name"] or "", key="first_name")
+    furigana = st.text_input("ふりがな", key="first_furigana") if conf["ask_furigana"] else ""
+    email = st.text_input("メールアドレス", value=first["email"] or "", key="first_email")
+    membership = ""
+    if conf["ask_membership"]:
+        membership = st.radio(conf["membership_label"] or "会員・非会員", ["選択してください", "会員", "非会員", "入会申請中、入会予定"], key="first_membership")
+    mobile = st.text_input("当日の緊急連絡先（携帯電話番号）", key="first_mobile") if conf["ask_mobile"] else ""
 
     correction = ""
     if conf["ask_correction"]:
@@ -576,7 +600,6 @@ def initial_form(conf, token, rows, pending):
             special_request = st.text_area("指定様式での発行、web申請のご希望", key="first_special")
             upload = st.file_uploader("指定様式アップロード", type=["pdf","doc","docx","xls","xlsx","xlsm","jpg","jpeg","png"], key="first_upload")
 
-    note = st.text_area("備考", placeholder="ご連絡事項がございましたら、ご入力ください。", key="first_note")
     submitted = st.button("回答を登録する", type="primary", use_container_width=True, key="first_submit")
     if not submitted:
         return
@@ -613,31 +636,32 @@ def initial_form(conf, token, rows, pending):
 
 
 def subsequent_form(conf, p, rows, pending):
-    locked_profile(conf, p, rows[0])
-    if not pending:
-        st.success("現在、新たにご回答いただく依頼はありません。")
-        return
-    st.markdown("### 今回ご回答いただくご依頼")
-    st.markdown('<div class="notice">今回入力できるのは「諾否」と「備考」のみです。</div>', unsafe_allow_html=True)
-    for r in pending:
-        request_summary_card(r)
-    with st.form("subsequent_response"):
-        answers, declines = {}, {}
+    if pending:
+        st.markdown("### 今回ご回答いただくご依頼")
+        st.markdown('<div class="notice">今回入力できるのは「諾否」と「備考」のみです。</div>', unsafe_allow_html=True)
         for r in pending:
-            label = f"{r['session_name']}｜{r['role']}"
-            answers[r["request_id"]] = st.radio(label, ["選択してください", "承諾する", "辞退する"], horizontal=True, key=f"ans2_{r['request_id']}")
-            declines[r["request_id"]] = st.text_area(f"辞退理由（{label}）※辞退の場合のみ", key=f"dec2_{r['request_id']}")
-        note = st.text_area("備考", placeholder="ご連絡事項がございましたら、ご入力ください。")
-        submitted = st.form_submit_button("今回の回答を登録する", type="primary", use_container_width=True)
-        if submitted:
-            if any(answers[r["request_id"]] == "選択してください" for r in pending):
-                st.error("すべてのご依頼について、承諾または辞退を選択してください。")
-                return
+            request_summary_card(r)
+        with st.form("subsequent_response"):
+            answers, declines = {}, {}
             for r in pending:
-                ans = "諾" if answers[r["request_id"]] == "承諾する" else "否"
-                save_response(conf["id"], r["request_id"], ans, declines[r["request_id"]], note)
-            st.success("回答を登録しました。")
-            st.rerun()
+                label = f"{r['session_name']}｜{r['role']}"
+                answers[r["request_id"]] = st.radio(label, ["選択してください", "承諾する", "辞退する"], horizontal=True, key=f"ans2_{r['request_id']}")
+                declines[r["request_id"]] = st.text_area(f"辞退理由（{label}）※辞退の場合のみ", key=f"dec2_{r['request_id']}")
+            note = st.text_area("備考", placeholder="ご連絡事項がございましたら、ご入力ください。")
+            submitted = st.form_submit_button("今回の回答を登録する", type="primary", use_container_width=True)
+            if submitted:
+                if any(answers[r["request_id"]] == "選択してください" for r in pending):
+                    st.error("すべてのご依頼について、承諾または辞退を選択してください。")
+                    return
+                for r in pending:
+                    ans = "諾" if answers[r["request_id"]] == "承諾する" else "否"
+                    save_response(conf["id"], r["request_id"], ans, declines[r["request_id"]], note)
+                st.success("回答を登録しました。")
+                st.rerun()
+    else:
+        st.success("現在、新たにご回答いただく依頼はありません。")
+
+    locked_profile(conf, p, rows[0])
 
 
 def user_page(conf_code, token):
@@ -664,6 +688,7 @@ def user_page(conf_code, token):
         st.info("既に回答済みですが、初回登録情報が見つかりません。事務局へお問い合わせください。")
     if done:
         st.markdown("### これまでに回答済みのご依頼")
+        st.caption("これまでにご回答いただいた内容です。")
         for r in done:
             request_summary_card(r)
 
@@ -676,7 +701,7 @@ def make_export(conf):
     headers = ["元Excel行","依頼ID","氏名","所属","メール","セッション名","テーマ","役割","日時","依頼状況","既存諾否","新回答","現在の諾否","回答日時","辞退理由","備考","マイページURL"]
     for c,h in enumerate(headers): ws.write(0,c,h,head)
     for rn,r in enumerate(rows,1):
-        url=f"{BASE_URL}/?c={conf['code']}&token={r['token']}"
+        url=person_url(conf["code"], r["token"])
         vals=[r['source_row'],r['request_id'],r['name'],r['affiliation'],r['email'],r['session_name'],r['theme'],r['role'],r['schedule'],r['request_sent'],r['source_answer'],r['new_answer'] or '',effective_answer(r) or '未回答',r['responded_at'] or '',r['decline_reason'] or '',r['note'] or '',url]
         for c,v in enumerate(vals): ws.write(rn,c,v)
     pheaders=["氏名","ふりがな","メール","所属","会員区分","携帯電話","修正依頼","招聘状等","所属長所属機関","所属長役職","所属長氏名","指定様式等","登録日時","登録元"]
@@ -687,6 +712,59 @@ def make_export(conf):
     ws.set_column(0,16,20); ws.set_column(16,16,56); pp.set_column(0,13,24)
     ws.freeze_panes(1,0); pp.freeze_panes(1,0); book.close(); out.seek(0)
     return out.getvalue()
+
+
+def make_url_export(conf, mode="all"):
+    rows = all_rows(conf["id"])
+    people = {p["token"]: p for p in all_people(conf["id"])}
+    grouped = {}
+    for r in rows:
+        g = grouped.setdefault(r["token"], {
+            "name": r["name"], "affiliation": r["affiliation"], "email": r["email"],
+            "total": 0, "answered": 0, "pending": 0, "additional": False,
+        })
+        g["total"] += 1
+        if effective_answer(r):
+            g["answered"] += 1
+        else:
+            g["pending"] += 1
+    for token, g in grouped.items():
+        p = people.get(token)
+        # A profile means the person has already completed initial registration.
+        # Pending requests after that are treated as additional/current requests.
+        g["additional"] = bool(p and p["registered_at"] and g["pending"] > 0)
+
+    selected = []
+    for token, g in grouped.items():
+        if mode == "pending" and g["pending"] == 0:
+            continue
+        if mode == "additional" and not g["additional"]:
+            continue
+        selected.append((token, g))
+
+    out = BytesIO()
+    book = xlsxwriter.Workbook(out, {"in_memory": True})
+    ws = book.add_worksheet("先生別URL")
+    head = book.add_format({"bold": True, "bg_color": "#1E526D", "font_color": "#FFFFFF", "border": 1})
+    headers = ["氏名", "所属", "メールアドレス", "学会コード", "専用URL", "依頼件数", "回答済み件数", "未回答件数", "追加依頼あり"]
+    for c, h in enumerate(headers):
+        ws.write(0, c, h, head)
+    for rn, (token, g) in enumerate(selected, 1):
+        vals = [
+            g["name"], g["affiliation"], g["email"], conf["code"], person_url(conf["code"], token),
+            g["total"], g["answered"], g["pending"], "○" if g["additional"] else "",
+        ]
+        for c, v in enumerate(vals):
+            ws.write(rn, c, v)
+    ws.set_column(0, 0, 18)
+    ws.set_column(1, 2, 30)
+    ws.set_column(3, 3, 14)
+    ws.set_column(4, 4, 72)
+    ws.set_column(5, 8, 14)
+    ws.freeze_panes(1, 0)
+    book.close()
+    out.seek(0)
+    return out.getvalue(), len(selected)
 
 
 def conference_settings_form(conf=None, key_prefix="conf"):
@@ -717,7 +795,7 @@ def admin_page():
     hero(APP_NAME, "1つの管理画面で複数の学会を作成・管理できます")
     if not ADMIN_PASSWORD:
         st.error("管理者パスワードが未設定です。Streamlit Secrets に ADMIN_PASSWORD を設定してください。")
-        st.code('ADMIN_PASSWORD = "十分に長いパスワード"\nTOKEN_SECRET = "ランダムな長い文字列"\nYESNO_BASE_URL = "https://あなたのアプリ.streamlit.app"', language="toml")
+        st.code('ADMIN_PASSWORD = "十分に長いパスワード"\nTOKEN_SECRET = "ランダムな長い文字列"', language="toml")
         return
     if not st.session_state.get("admin_ok"):
         pw = st.text_input("管理者パスワード", type="password")
@@ -784,8 +862,40 @@ def admin_page():
                 for r in rows:
                     if r['token'] not in seen:
                         seen[r['token']]=1
-                        urls.append({"氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],"専用URL":f"{BASE_URL}/?c={conf['code']}&token={r['token']}"})
+                        person_rows=[x for x in rows if x['token']==r['token']]
+                        pending_count=sum(not effective_answer(x) for x in person_rows)
+                        answered_count=sum(bool(effective_answer(x)) for x in person_rows)
+                        p=get_profile(conf['id'], r['token'])
+                        additional=bool(p and p['registered_at'] and pending_count>0)
+                        urls.append({
+                            "氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],
+                            "未回答":pending_count,"回答済み":answered_count,
+                            "追加依頼":"○" if additional else "",
+                            "専用URL":person_url(conf["code"], r["token"])
+                        })
+                st.caption(f"専用URLの本体部分は自動取得しています：{get_base_url()}")
                 st.dataframe(urls,use_container_width=True,hide_index=True)
+                if rows:
+                    st.markdown("#### URL一覧をExcelでダウンロード")
+                    c_all,c_pending,c_add=st.columns(3)
+                    data_all,n_all=make_url_export(conf,"all")
+                    data_pending,n_pending=make_url_export(conf,"pending")
+                    data_add,n_add=make_url_export(conf,"additional")
+                    c_all.download_button(
+                        f"全員（{n_all}名）", data_all, f"{conf['code']}_先生別URL_全員.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key=f"url_all_{conf['id']}"
+                    )
+                    c_pending.download_button(
+                        f"未回答あり（{n_pending}名）", data_pending, f"{conf['code']}_先生別URL_未回答.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key=f"url_pending_{conf['id']}"
+                    )
+                    c_add.download_button(
+                        f"追加依頼あり（{n_add}名）", data_add, f"{conf['code']}_先生別URL_追加依頼.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key=f"url_add_{conf['id']}"
+                    )
             with subtabs[3]:
                 values=conference_settings_form(conf, key_prefix=f"edit_{conf['id']}")
                 if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):

@@ -18,7 +18,7 @@ from python_calamine import CalamineWorkbook
 import xlsxwriter
 from sqlalchemy import create_engine, text
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.2"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.4（表示ロジック復元版）"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -36,17 +36,26 @@ DATABASE_URL = get_secret("DATABASE_URL", "").strip()
 
 # DATABASE_URL が設定されていれば外部PostgreSQLへ保存。未設定時は従来どおりローカルSQLite。
 # Streamlit Community Cloud ではローカルファイルは永続ではないため、本番運用では DATABASE_URL を推奨。
-if DATABASE_URL:
-    db_url = DATABASE_URL
-    if db_url.startswith("postgresql://"):
-        db_url = "postgresql+pg8000://" + db_url[len("postgresql://"):]
-    elif db_url.startswith("postgres://"):
-        db_url = "postgresql+pg8000://" + db_url[len("postgres://"):]
-    ENGINE = create_engine(db_url, pool_pre_ping=True, future=True)
-    DB_BACKEND = "PostgreSQL（永続保存）"
-else:
-    ENGINE = create_engine(f"sqlite:///{DB_PATH}", future=True)
-    DB_BACKEND = "SQLite（ローカル）"
+@st.cache_resource(show_spinner=False)
+def build_engine(database_url, db_path):
+    if database_url:
+        db_url = database_url
+        if db_url.startswith("postgresql://"):
+            db_url = "postgresql+pg8000://" + db_url[len("postgresql://"):]
+        elif db_url.startswith("postgres://"):
+            db_url = "postgresql+pg8000://" + db_url[len("postgres://"):]
+        return create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            pool_size=5,
+            max_overflow=2,
+            future=True,
+        )
+    return create_engine(f"sqlite:///{db_path}", future=True)
+
+ENGINE = build_engine(DATABASE_URL, DB_PATH)
+DB_BACKEND = "PostgreSQL（永続保存）" if DATABASE_URL else "SQLite（ローカル）"
 
 # 共通メール送信設定（Streamlit Secretsで1回だけ設定）
 SMTP_HOST = get_secret("SMTP_HOST", "").strip()
@@ -384,7 +393,7 @@ def auto_mapping(headers):
         "schedule": first_index(idx, ["候補日時", "日時", "登壇日時"]),
         "answer": first_index(idx, ["諾否", "回答", "諾否回答"], "first"),
         "deadline": first_index(idx, ["諾否締切", "回答期限", "締切"]),
-        "sent": first_index(idx, ["依頼送付", "依頼送信", "依頼状況", "送信状況"]),
+        "sent": first_index(idx, ["依頼送信", "依頼状況", "送信状況"]),
         "seq": first_index(idx, ["スプシセッション順No.", "依頼ID", "No.", "番号"]),
     }
     legacy = {
@@ -416,7 +425,7 @@ def mapping_display(headers, mapping):
     rows = []
     labels = {
         "name":"氏名", "session":"セッション名", "role":"役割", "affiliation":"所属", "email":"メール",
-        "theme":"テーマ", "schedule":"日時", "answer":"既存諾否", "deadline":"回答期限", "sent":"依頼送付", "seq":"依頼ID/順番"
+        "theme":"テーマ", "schedule":"日時", "answer":"既存諾否", "deadline":"回答期限", "sent":"依頼状況", "seq":"依頼ID/順番"
     }
     for k, label in labels.items():
         i = mapping.get(k)
@@ -450,10 +459,6 @@ def import_master(conf, file_bytes, sheet_name=None):
         source_answer = normalize_answer(cell(row, mapping["answer"]))
         deadline = clean(cell(row, mapping["deadline"])) or clean(conf["reply_deadline"])
         sent = clean(cell(row, mapping["sent"]))
-        # 「依頼送付」系の列が存在する場合は、値が入っている依頼だけを公開対象として取り込む。
-        # 列自体がない学会Excelでは従来どおり全依頼を取り込む。
-        if mapping["sent"] is not None and not sent:
-            continue
         seq = clean(cell(row, mapping["seq"]))
         token = conference_token(conf["code"], email, name)
         rid = request_id(conf["code"], excel_row, seq, session, role, name)

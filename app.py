@@ -18,7 +18,7 @@ from python_calamine import CalamineWorkbook
 import xlsxwriter
 from sqlalchemy import create_engine, text
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.1"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -425,6 +425,11 @@ def mapping_display(headers, mapping):
 
 
 def import_master(conf, file_bytes, sheet_name=None):
+    """Excelを一括取込する。
+
+    外部PostgreSQL利用時の遅延を避けるため、依頼・既存プロフィールを
+    1件ずつ往復せず、1トランザクション内でまとめて反映する。
+    """
     _, sheet_name, headers, rows = read_workbook_sheet(file_bytes, sheet_name)
     mapping, legacy = auto_mapping(headers)
     missing = [x for x in ("name", "session", "role") if mapping[x] is None]
@@ -457,7 +462,7 @@ def import_master(conf, file_bytes, sheet_name=None):
 
         legacy_signal = clean(cell(row, legacy["receipt"])) or clean(cell(row, legacy["sent_at"])) or clean(cell(row, legacy["form_name"]))
         if legacy_signal:
-            p = {
+            prof = {
                 "conference_id": conf["id"], "token": token,
                 "name": clean(cell(row, legacy["form_name"])) or name,
                 "email": clean(cell(row, legacy["form_email"])) or email,
@@ -476,31 +481,48 @@ def import_master(conf, file_bytes, sheet_name=None):
                 "source": "legacy_import",
             }
             old = profiles.get(token)
-            if not old or p["registered_at"] >= old["registered_at"]:
-                profiles[token] = p
+            if not old or prof["registered_at"] >= old["registered_at"]:
+                profiles[token] = prof
 
     now = datetime.now().isoformat(timespec="seconds")
+    for r in records:
+        r["imported_at"] = now
+
+    request_sql = text("""
+        INSERT INTO requests(conference_id,request_id,source_sheet,source_row,source_seq,token,name,affiliation,email,session_name,theme,role,schedule,source_answer,deadline,request_sent,imported_at)
+        VALUES(:conference_id,:request_id,:source_sheet,:source_row,:source_seq,:token,:name,:affiliation,:email,:session_name,:theme,:role,:schedule,:source_answer,:deadline,:request_sent,:imported_at)
+        ON CONFLICT(request_id) DO UPDATE SET
+            source_sheet=excluded.source_sheet,source_row=excluded.source_row,source_seq=excluded.source_seq,token=excluded.token,
+            name=excluded.name,affiliation=excluded.affiliation,email=excluded.email,session_name=excluded.session_name,
+            theme=excluded.theme,role=excluded.role,schedule=excluded.schedule,source_answer=excluded.source_answer,
+            deadline=excluded.deadline,request_sent=excluded.request_sent,imported_at=excluded.imported_at
+    """)
+    profile_sql = text("""
+        INSERT INTO people(conference_id,token,name,email,affiliation,furigana,membership,mobile,correction,invitation,leader_org,leader_title,leader_name,
+                           special_request,upload_name,upload_path,registered_at,source)
+        VALUES(:conference_id,:token,:name,:email,:affiliation,:furigana,:membership,:mobile,:correction,:invitation,:leader_org,:leader_title,:leader_name,
+               :special_request,:upload_name,:upload_path,:registered_at,:source)
+        ON CONFLICT(conference_id,token) DO UPDATE SET
+            name=excluded.name,email=excluded.email,affiliation=excluded.affiliation,furigana=excluded.furigana,membership=excluded.membership,
+            mobile=excluded.mobile,correction=excluded.correction,invitation=excluded.invitation,leader_org=excluded.leader_org,
+            leader_title=excluded.leader_title,leader_name=excluded.leader_name,special_request=excluded.special_request,
+            upload_name=excluded.upload_name,upload_path=CASE WHEN excluded.upload_path<>'' THEN excluded.upload_path ELSE people.upload_path END,
+            registered_at=excluded.registered_at,source=excluded.source
+        WHERE people.source IS NULL OR people.source <> 'system'
+    """)
+
     ids = {r["request_id"] for r in records}
     with ENGINE.begin() as con:
         existing = [x[0] for x in con.execute(text("SELECT request_id FROM requests WHERE conference_id=:cid"), {"cid": conf["id"]}).fetchall()]
-        for rid in existing:
-            if rid not in ids:
-                con.execute(text("DELETE FROM responses WHERE request_id=:rid"), {"rid": rid})
-                con.execute(text("DELETE FROM requests WHERE request_id=:rid"), {"rid": rid})
-        for r in records:
-            params = dict(r)
-            params["imported_at"] = now
-            con.execute(text("""
-            INSERT INTO requests(conference_id,request_id,source_sheet,source_row,source_seq,token,name,affiliation,email,session_name,theme,role,schedule,source_answer,deadline,request_sent,imported_at)
-            VALUES(:conference_id,:request_id,:source_sheet,:source_row,:source_seq,:token,:name,:affiliation,:email,:session_name,:theme,:role,:schedule,:source_answer,:deadline,:request_sent,:imported_at)
-            ON CONFLICT(request_id) DO UPDATE SET
-                source_sheet=excluded.source_sheet,source_row=excluded.source_row,source_seq=excluded.source_seq,token=excluded.token,
-                name=excluded.name,affiliation=excluded.affiliation,email=excluded.email,session_name=excluded.session_name,
-                theme=excluded.theme,role=excluded.role,schedule=excluded.schedule,source_answer=excluded.source_answer,
-                deadline=excluded.deadline,request_sent=excluded.request_sent,imported_at=excluded.imported_at
-            """), params)
-    for p in profiles.values():
-        upsert_profile(p, overwrite=False)
+        obsolete = [{"rid": rid} for rid in existing if rid not in ids]
+        if obsolete:
+            con.execute(text("DELETE FROM responses WHERE request_id=:rid"), obsolete)
+            con.execute(text("DELETE FROM requests WHERE request_id=:rid"), obsolete)
+        if records:
+            con.execute(request_sql, records)
+        if profiles:
+            con.execute(profile_sql, list(profiles.values()))
+
     return records, list(profiles.values()), headers, mapping
 
 
@@ -1214,28 +1236,33 @@ def admin_page():
                         mapping,_=auto_mapping(headers)
                         st.caption(f"読み取り対象シート：{sname}")
                         st.dataframe(mapping_display(headers,mapping),use_container_width=True,hide_index=True)
+                        result_key=f"import_result_{conf['id']}"
                         if st.button("このExcelを取り込む",type="primary",key=f"import_{conf['id']}"):
-                            records,profiles,_,_=import_master(conf,up.getvalue(),sname)
-                            st.success(f"依頼 {len(records)}件、既存の初回登録情報 {len(profiles)}名分を取り込みました。")
+                            with st.spinner("Excelを取り込んでいます。完了するまでこのボタンを押し直さずお待ちください…"):
+                                records,profiles,_,_=import_master(conf,up.getvalue(),sname)
+                            st.session_state[result_key]=f"依頼 {len(records)}件、既存の初回登録情報 {len(profiles)}名分を取り込みました。"
                             st.rerun()
+                        if st.session_state.get(result_key):
+                            st.success(st.session_state[result_key])
                     except Exception as e:
                         st.error(f"Excelの読み取りに失敗しました：{e}")
             with subtabs[2]:
-                rows=all_rows(conf['id']); seen={}; urls=[]
+                rows=all_rows(conf['id']); urls=[]
+                people_map={p['token']:p for p in all_people(conf['id'])}
+                grouped={}
                 for r in rows:
-                    if r['token'] not in seen:
-                        seen[r['token']]=1
-                        person_rows=[x for x in rows if x['token']==r['token']]
-                        pending_count=sum(not effective_answer(x) for x in person_rows)
-                        answered_count=sum(bool(effective_answer(x)) for x in person_rows)
-                        p=get_profile(conf['id'], r['token'])
-                        additional=bool(p and p['registered_at'] and pending_count>0)
-                        urls.append({
-                            "氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],
-                            "未回答":pending_count,"回答済み":answered_count,
-                            "追加依頼":"○" if additional else "",
-                            "専用URL":person_url(conf["code"], r["token"])
-                        })
+                    g=grouped.setdefault(r['token'], {"row":r,"pending":0,"answered":0})
+                    if effective_answer(r): g["answered"] += 1
+                    else: g["pending"] += 1
+                for token,g in grouped.items():
+                    r=g["row"]; p=people_map.get(token)
+                    additional=bool(p and p.get('registered_at') and g["pending"]>0)
+                    urls.append({
+                        "氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],
+                        "未回答":g["pending"],"回答済み":g["answered"],
+                        "追加依頼":"○" if additional else "",
+                        "専用URL":person_url(conf["code"], token)
+                    })
                 st.caption(f"専用URLの本体部分は自動取得しています：{get_base_url()}")
                 st.dataframe(urls,use_container_width=True,hide_index=True)
                 if rows:

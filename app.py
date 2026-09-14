@@ -18,7 +18,7 @@ from python_calamine import CalamineWorkbook
 import xlsxwriter
 from sqlalchemy import create_engine, text
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.1"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.2"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -868,7 +868,6 @@ def request_summary_card(r):
       <div class="meta">
         <div class="k">日時</div><div>{r['schedule'] or '―'}</div>
         <div class="k">回答期限</div><div>{r['deadline'] or '―'}</div>
-        <div class="k">依頼状況</div><div>{r['request_sent'] or '―'}</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1046,20 +1045,63 @@ def make_export(conf):
     out = BytesIO(); book = xlsxwriter.Workbook(out, {"in_memory":True})
     ws = book.add_worksheet("回答一覧"); pp = book.add_worksheet("先生情報")
     head = book.add_format({"bold":True,"bg_color":"#1E526D","font_color":"#FFFFFF","border":1})
-    headers = ["元Excel行","依頼ID","氏名","所属","メール","セッション名","テーマ","役割","日時","依頼状況","既存諾否","新回答","現在の諾否","回答日時","辞退理由","備考","マイページURL"]
+    headers = ["元Excel行","依頼ID","氏名","所属","メール","セッション名","テーマ","役割","日時","既存諾否","新回答","現在の諾否","回答日時","辞退理由","備考","マイページURL"]
     for c,h in enumerate(headers): ws.write(0,c,h,head)
     for rn,r in enumerate(rows,1):
         url=person_url(conf["code"], r["token"])
-        vals=[r['source_row'],r['request_id'],r['name'],r['affiliation'],r['email'],r['session_name'],r['theme'],r['role'],r['schedule'],r['request_sent'],r['source_answer'],r['new_answer'] or '',effective_answer(r) or '未回答',r['responded_at'] or '',r['decline_reason'] or '',r['note'] or '',url]
+        vals=[r['source_row'],r['request_id'],r['name'],r['affiliation'],r['email'],r['session_name'],r['theme'],r['role'],r['schedule'],r['source_answer'],r['new_answer'] or '',effective_answer(r) or '未回答',r['responded_at'] or '',r['decline_reason'] or '',r['note'] or '',url]
         for c,v in enumerate(vals): ws.write(rn,c,v)
     pheaders=["氏名","ふりがな","メール","所属","会員区分","携帯電話","修正依頼","招聘状等","所属長所属機関","所属長役職","所属長氏名","指定様式等","登録日時","登録元"]
     for c,h in enumerate(pheaders): pp.write(0,c,h,head)
     for rn,p in enumerate(all_people(conf['id']),1):
         vals=[p['name'],p['furigana'],p['email'],p['affiliation'],p['membership'],p['mobile'],p['correction'],p['invitation'],p['leader_org'],p['leader_title'],p['leader_name'],p['special_request'],p['registered_at'],p['source']]
         for c,v in enumerate(vals): pp.write(rn,c,v or '')
-    ws.set_column(0,16,20); ws.set_column(16,16,56); pp.set_column(0,13,24)
+    ws.set_column(0,15,20); ws.set_column(15,15,56); pp.set_column(0,13,24)
     ws.freeze_panes(1,0); pp.freeze_panes(1,0); book.close(); out.seek(0)
     return out.getvalue()
+
+
+def url_summary_rows(conf_id):
+    """先生別URL画面用の集計をDB側で一括計算する。"""
+    return db_fetchall("""
+        SELECT
+            r.token,
+            MAX(r.name) AS name,
+            MAX(r.affiliation) AS affiliation,
+            MAX(r.email) AS email,
+            COUNT(*) AS total,
+            SUM(CASE WHEN COALESCE(NULLIF(r.source_answer,''), NULLIF(s.answer,'')) IS NOT NULL THEN 1 ELSE 0 END) AS answered,
+            SUM(CASE WHEN COALESCE(NULLIF(r.source_answer,''), NULLIF(s.answer,'')) IS NULL THEN 1 ELSE 0 END) AS pending,
+            MAX(CASE WHEN p.registered_at IS NOT NULL AND p.registered_at <> '' THEN 1 ELSE 0 END) AS registered
+        FROM requests r
+        LEFT JOIN responses s ON s.request_id=r.request_id
+        LEFT JOIN people p ON p.conference_id=r.conference_id AND p.token=r.token
+        WHERE r.conference_id=:cid
+        GROUP BY r.token
+        ORDER BY MAX(r.name)
+    """, {"cid": conf_id})
+
+
+def make_url_export_from_summaries(conf, summaries, mode="all"):
+    selected=[]
+    for g in summaries:
+        pending=int(g.get("pending") or 0)
+        additional=bool(int(g.get("registered") or 0) and pending > 0)
+        if mode == "pending" and pending == 0:
+            continue
+        if mode == "additional" and not additional:
+            continue
+        selected.append((g, additional))
+    out=BytesIO(); book=xlsxwriter.Workbook(out,{"in_memory":True}); ws=book.add_worksheet("先生別URL")
+    head=book.add_format({"bold":True,"bg_color":"#1E526D","font_color":"#FFFFFF","border":1})
+    headers=["氏名","所属","メールアドレス","学会コード","専用URL","依頼件数","回答済み件数","未回答件数","追加依頼あり"]
+    for c,h in enumerate(headers): ws.write(0,c,h,head)
+    for rn,(g,additional) in enumerate(selected,1):
+        vals=[g.get("name") or "",g.get("affiliation") or "",g.get("email") or "",conf["code"],person_url(conf["code"],g["token"]),int(g.get("total") or 0),int(g.get("answered") or 0),int(g.get("pending") or 0),"○" if additional else ""]
+        for c,v in enumerate(vals): ws.write(rn,c,v)
+    ws.set_column(0,0,18); ws.set_column(1,2,30); ws.set_column(3,3,14); ws.set_column(4,4,72); ws.set_column(5,8,14); ws.freeze_panes(1,0)
+    book.close(); out.seek(0)
+    return out.getvalue(), len(selected)
 
 
 def make_url_export(conf, mode="all"):
@@ -1187,22 +1229,31 @@ def admin_page():
         if st.button("ログイン", type="primary"):
             if hmac.compare_digest(pw.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
                 st.session_state.admin_ok=True; st.rerun()
-            else: st.error("パスワードが違います。")
+            else:
+                st.error("パスワードが違います。")
         return
 
-    confs = list_conferences()
-    tabs = st.tabs(["学会一覧", "＋ 新しい学会", "学会管理", "運用設定"])
-    with tabs[0]:
+    main_menu = st.radio("管理メニュー", ["学会一覧", "＋ 新しい学会", "学会管理", "運用設定"], horizontal=True, label_visibility="collapsed", key="admin_main_menu")
+
+    if main_menu == "学会一覧":
+        confs = list_conferences()
         if not confs:
             st.info("まだ学会がありません。『＋ 新しい学会』から作成してください。")
         else:
             data=[]
             for c in confs:
-                rows=all_rows(c['id']); yes=sum(effective_answer(r)=='諾' for r in rows); no=sum(effective_answer(r)=='否' for r in rows); pending=sum(not effective_answer(r) for r in rows)
-                data.append({"コード":c['code'],"学会名":c['name'],"会期":c['dates'],"依頼件数":len(rows),"承諾":yes,"辞退":no,"未回答":pending,"招聘状セット":"ON" if c['invitation_enabled'] else "OFF","状態":"有効" if c['active'] else "停止"})
+                stat = db_fetchone("""
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN COALESCE(NULLIF(r.source_answer,''), NULLIF(s.answer,''))='諾' THEN 1 ELSE 0 END) AS yes_count,
+                           SUM(CASE WHEN COALESCE(NULLIF(r.source_answer,''), NULLIF(s.answer,''))='否' THEN 1 ELSE 0 END) AS no_count,
+                           SUM(CASE WHEN COALESCE(NULLIF(r.source_answer,''), NULLIF(s.answer,'')) IS NULL THEN 1 ELSE 0 END) AS pending_count
+                    FROM requests r LEFT JOIN responses s ON s.request_id=r.request_id
+                    WHERE r.conference_id=:cid
+                """, {"cid": c["id"]}) or {}
+                data.append({"コード":c['code'],"学会名":c['name'],"会期":c['dates'],"依頼件数":int(stat.get('total') or 0),"承諾":int(stat.get('yes_count') or 0),"辞退":int(stat.get('no_count') or 0),"未回答":int(stat.get('pending_count') or 0),"招聘状セット":"ON" if c['invitation_enabled'] else "OFF","状態":"有効" if c['active'] else "停止"})
             st.dataframe(data,use_container_width=True,hide_index=True)
 
-    with tabs[1]:
+    elif main_menu == "＋ 新しい学会":
         values=conference_settings_form(key_prefix="new_conf")
         if st.button("この学会を作成",type="primary",use_container_width=True):
             if not values['code'] or not re.fullmatch(r"[A-Za-z0-9_-]+",values['code']): st.error("学会コードは半角英数字・_・-で入力してください。")
@@ -1211,172 +1262,106 @@ def admin_page():
             else:
                 create_conference(values); st.success("学会を作成しました。『学会管理』からExcelを取り込んでください。"); st.rerun()
 
-    with tabs[2]:
+    elif main_menu == "学会管理":
         confs = list_conferences()
         if not confs:
             st.info("先に学会を作成してください。")
-        else:
-            labels={f"{c['code']}｜{c['name']}":c for c in confs}
-            selected=st.selectbox("管理する学会",list(labels.keys()))
-            conf=labels[selected]
-            subtabs=st.tabs(["回答状況","Excel取込","先生別URL","学会設定","先生情報"])
-            with subtabs[0]:
-                rows=all_rows(conf['id']); data=[]
-                for r in rows:
-                    data.append({"元Excel行":r['source_row'],"氏名":r['name'],"セッション":r['session_name'],"役割":r['role'],"既存":r['source_answer'] or '',"新回答":r['new_answer'] or '',"現在":effective_answer(r) or '未回答',"依頼状況":r['request_sent'],"回答日時":r['responded_at'] or ''})
-                st.dataframe(data,use_container_width=True,hide_index=True)
-                if rows:
-                    st.download_button("回答一覧をExcelでダウンロード",make_export(conf),f"{conf['code']}_諾否回答一覧.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-            with subtabs[1]:
-                st.write("この学会の指定演題・登壇者Excelを取り込みます。氏名／セッション／役割などは見出し名から自動判定します。")
-                up=st.file_uploader("Excel（.xlsm / .xlsx）",type=["xlsm","xlsx"],key=f"up_{conf['id']}")
-                if up:
-                    try:
-                        _, sname, headers, _ = read_workbook_sheet(up.getvalue())
-                        mapping,_=auto_mapping(headers)
-                        st.caption(f"読み取り対象シート：{sname}")
-                        st.dataframe(mapping_display(headers,mapping),use_container_width=True,hide_index=True)
-                        result_key=f"import_result_{conf['id']}"
-                        if st.button("このExcelを取り込む",type="primary",key=f"import_{conf['id']}"):
-                            with st.spinner("Excelを取り込んでいます。完了するまでこのボタンを押し直さずお待ちください…"):
-                                records,profiles,_,_=import_master(conf,up.getvalue(),sname)
-                            st.session_state[result_key]=f"依頼 {len(records)}件、既存の初回登録情報 {len(profiles)}名分を取り込みました。"
-                            st.rerun()
-                        if st.session_state.get(result_key):
-                            st.success(st.session_state[result_key])
-                    except Exception as e:
-                        st.error(f"Excelの読み取りに失敗しました：{e}")
-            with subtabs[2]:
-                rows=all_rows(conf['id']); urls=[]
-                people_map={p['token']:p for p in all_people(conf['id'])}
-                grouped={}
-                for r in rows:
-                    g=grouped.setdefault(r['token'], {"row":r,"pending":0,"answered":0})
-                    if effective_answer(r): g["answered"] += 1
-                    else: g["pending"] += 1
-                for token,g in grouped.items():
-                    r=g["row"]; p=people_map.get(token)
-                    additional=bool(p and p.get('registered_at') and g["pending"]>0)
-                    urls.append({
-                        "氏名":r['name'],"所属":r['affiliation'],"メール":r['email'],
-                        "未回答":g["pending"],"回答済み":g["answered"],
-                        "追加依頼":"○" if additional else "",
-                        "専用URL":person_url(conf["code"], token)
-                    })
-                st.caption(f"専用URLの本体部分は自動取得しています：{get_base_url()}")
-                st.dataframe(urls,use_container_width=True,hide_index=True)
-                if rows:
-                    st.markdown("#### URL一覧をExcelでダウンロード")
-                    c_all,c_pending,c_add=st.columns(3)
-                    data_all,n_all=make_url_export(conf,"all")
-                    data_pending,n_pending=make_url_export(conf,"pending")
-                    data_add,n_add=make_url_export(conf,"additional")
-                    c_all.download_button(
-                        f"全員（{n_all}名）", data_all, f"{conf['code']}_先生別URL_全員.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key=f"url_all_{conf['id']}"
-                    )
-                    c_pending.download_button(
-                        f"未回答あり（{n_pending}名）", data_pending, f"{conf['code']}_先生別URL_未回答.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key=f"url_pending_{conf['id']}"
-                    )
-                    c_add.download_button(
-                        f"追加依頼あり（{n_add}名）", data_add, f"{conf['code']}_先生別URL_追加依頼.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key=f"url_add_{conf['id']}"
-                    )
-                    reminder_data, reminder_count = make_reminder_export(conf)
-                    st.download_button(
-                        f"未回答者 催促メール用Excel（{reminder_count}名）", reminder_data, f"{conf['code']}_未回答者_催促メール用.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key=f"reminder_{conf['id']}"
-                    )
-            with subtabs[3]:
-                values=conference_settings_form(conf, key_prefix=f"edit_{conf['id']}")
-                if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):
-                    update_conference(conf['id'],values); st.success("保存しました。"); st.rerun()
+            return
+        labels={f"{c['code']}｜{c['name']}":c for c in confs}
+        selected=st.selectbox("管理する学会",list(labels.keys()), key="manage_conf_select")
+        conf=labels[selected]
+        manage_menu=st.radio("学会管理メニュー",["回答状況","Excel取込","先生別URL","学会設定","先生情報"],horizontal=True,label_visibility="collapsed",key=f"manage_menu_{conf['id']}")
 
-                st.divider()
-                with st.expander("⚠ この学会を削除", expanded=False):
-                    st.warning("この操作は取り消せません。この学会に紐づく先生情報・依頼・回答もすべて削除します。")
-                    confirm_code = st.text_input(
-                        f"確認のため学会コード「{conf['code']}」を入力してください",
-                        key=f"delete_code_{conf['id']}"
-                    )
-                    delete_ok = confirm_code.strip() == conf['code']
-                    if st.button(
-                        "この学会を完全に削除",
-                        type="secondary",
-                        disabled=not delete_ok,
-                        key=f"delete_conf_{conf['id']}",
-                        use_container_width=True,
-                    ):
-                        deleted_name = conf['name']
-                        deleted_code = conf['code']
-                        delete_conference(conf['id'])
-                        st.success(f"{deleted_code}｜{deleted_name} を削除しました。")
+        if manage_menu == "回答状況":
+            rows=all_rows(conf['id']); data=[]
+            for r in rows:
+                data.append({"元Excel行":r['source_row'],"氏名":r['name'],"セッション":r['session_name'],"役割":r['role'],"既存":r['source_answer'] or '',"新回答":r['new_answer'] or '',"現在":effective_answer(r) or '未回答',"回答日時":r['responded_at'] or ''})
+            st.dataframe(data,use_container_width=True,hide_index=True)
+            if rows:
+                st.download_button("回答一覧をExcelでダウンロード",make_export(conf),f"{conf['code']}_諾否回答一覧.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        elif manage_menu == "Excel取込":
+            st.write("この学会の指定演題・登壇者Excelを取り込みます。氏名／セッション／役割などは見出し名から自動判定します。")
+            up=st.file_uploader("Excel（.xlsm / .xlsx）",type=["xlsm","xlsx"],key=f"up_{conf['id']}")
+            if up:
+                try:
+                    _, sname, headers, _ = read_workbook_sheet(up.getvalue())
+                    mapping,_=auto_mapping(headers)
+                    st.caption(f"読み取り対象シート：{sname}")
+                    st.dataframe(mapping_display(headers,mapping),use_container_width=True,hide_index=True)
+                    result_key=f"import_result_{conf['id']}"
+                    if st.button("このExcelを取り込む",type="primary",key=f"import_{conf['id']}"):
+                        with st.spinner("Excelを取り込んでいます。完了するまでこのボタンを押し直さずお待ちください…"):
+                            records,profiles,_,_=import_master(conf,up.getvalue(),sname)
+                        st.session_state[result_key]=f"依頼 {len(records)}件、既存の初回登録情報 {len(profiles)}名分を取り込みました。"
                         st.rerun()
-            with subtabs[4]:
-                ps=[]
-                for p in all_people(conf['id']):
-                    ps.append({"氏名":p['name'],"ふりがな":p['furigana'],"メール":p['email'],"会員区分":p['membership'],"携帯電話":p['mobile'],"招聘状等":p['invitation'],"登録元":p['source'],"登録日時":p['registered_at']})
-                st.dataframe(ps,use_container_width=True,hide_index=True)
+                    if st.session_state.get(result_key): st.success(st.session_state[result_key])
+                except Exception as e: st.error(f"Excelの読み取りに失敗しました：{e}")
 
-    with tabs[3]:
+        elif manage_menu == "先生別URL":
+            with st.spinner("先生別URLを読み込んでいます…"):
+                summaries=url_summary_rows(conf['id'])
+            urls=[]
+            for g in summaries:
+                pending=int(g.get('pending') or 0); answered=int(g.get('answered') or 0); additional=bool(int(g.get('registered') or 0) and pending>0)
+                urls.append({"氏名":g.get('name') or '',"所属":g.get('affiliation') or '',"メール":g.get('email') or '',"未回答":pending,"回答済み":answered,"追加依頼":"○" if additional else "","専用URL":person_url(conf["code"],g["token"])})
+            st.caption(f"専用URLの本体部分は自動取得しています：{get_base_url()}")
+            st.dataframe(urls,use_container_width=True,hide_index=True)
+            if summaries:
+                st.markdown("#### URL一覧をExcelでダウンロード")
+                c_all,c_pending,c_add=st.columns(3)
+                data_all,n_all=make_url_export_from_summaries(conf,summaries,"all")
+                data_pending,n_pending=make_url_export_from_summaries(conf,summaries,"pending")
+                data_add,n_add=make_url_export_from_summaries(conf,summaries,"additional")
+                c_all.download_button(f"全員（{n_all}名）",data_all,f"{conf['code']}_先生別URL_全員.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_all_{conf['id']}")
+                c_pending.download_button(f"未回答あり（{n_pending}名）",data_pending,f"{conf['code']}_先生別URL_未回答.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_pending_{conf['id']}")
+                c_add.download_button(f"追加依頼あり（{n_add}名）",data_add,f"{conf['code']}_先生別URL_追加依頼.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_add_{conf['id']}")
+                reminder_data,reminder_count=make_reminder_export(conf)
+                st.download_button(f"未回答者 催促メール用Excel（{reminder_count}名）",reminder_data,f"{conf['code']}_未回答者_催促メール用.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"reminder_{conf['id']}")
+
+        elif manage_menu == "学会設定":
+            values=conference_settings_form(conf,key_prefix=f"edit_{conf['id']}")
+            if st.button("設定を保存",type="primary",key=f"save_conf_{conf['id']}"):
+                update_conference(conf['id'],values); st.success("保存しました。"); st.rerun()
+            st.divider()
+            with st.expander("⚠ この学会を削除",expanded=False):
+                st.warning("この操作は取り消せません。この学会に紐づく先生情報・依頼・回答もすべて削除します。")
+                confirm_code=st.text_input(f"確認のため学会コード「{conf['code']}」を入力してください",key=f"delete_code_{conf['id']}")
+                if st.button("この学会を完全に削除",type="secondary",disabled=confirm_code.strip()!=conf['code'],key=f"delete_conf_{conf['id']}",use_container_width=True):
+                    deleted_name=conf['name']; deleted_code=conf['code']; delete_conference(conf['id']); st.success(f"{deleted_code}｜{deleted_name} を削除しました。"); st.rerun()
+
+        elif manage_menu == "先生情報":
+            ps=[]
+            for p in all_people(conf['id']): ps.append({"氏名":p['name'],"ふりがな":p['furigana'],"メール":p['email'],"会員区分":p['membership'],"携帯電話":p['mobile'],"招聘状等":p['invitation'],"登録元":p['source'],"登録日時":p['registered_at']})
+            st.dataframe(ps,use_container_width=True,hide_index=True)
+
+    elif main_menu == "運用設定":
         st.markdown("#### データ保存")
-        if DATABASE_URL:
-            st.success(f"永続保存：{DB_BACKEND} に接続中です。Streamlitの再起動・再デプロイ後も回答データが残ります。")
+        if DATABASE_URL: st.success(f"永続保存：{DB_BACKEND} に接続中です。Streamlitの再起動・再デプロイ後も回答データが残ります。")
         else:
             st.warning("現在はローカルSQLite保存です。Streamlit Community Cloudでは再起動・再デプロイでデータが消える可能性があります。")
-            st.caption("本番運用では Streamlit Secrets に DATABASE_URL を1行追加すると、外部PostgreSQLへ切り替わります。")
             st.code('DATABASE_URL = "postgresql://ユーザー名:パスワード@ホスト名:5432/データベース名"', language="toml")
         st.markdown("##### システム全体のバックアップ")
-        st.caption("学会設定・先生情報・依頼・回答・アップロードファイルをまとめて保存します。永続DBへ切り替える前にも一度ダウンロードしてください。")
-        st.download_button(
-            "システムバックアップをダウンロード",
-            make_system_backup(),
-            f"yesno_system_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            "application/json",
-            use_container_width=True,
-            key="system_backup_download",
-        )
-        restore_file = st.file_uploader("バックアップから復元", type=["json"], key="system_backup_restore")
-        if restore_file and st.button("このバックアップを復元する", key="system_backup_restore_btn"):
-            try:
-                restore_system_backup(restore_file.getvalue())
-                st.success("バックアップを復元しました。")
-                st.rerun()
-            except Exception as e:
-                st.error(f"復元できませんでした：{e}")
-
-        st.markdown("新しい学会は、この管理画面で『＋ 新しい学会』→設定→Excel取込だけで追加できます。")
-        st.markdown("招聘状セットなどの質問項目は学会ごとに設定できます。回答受付メールは常に回答者へ送信し、同じメールを学会事務局へCCします。")
+        st.caption("学会設定・先生情報・依頼・回答・アップロードファイルをまとめて保存します。")
+        if st.button("バックアップデータを準備",key="prepare_backup"):
+            with st.spinner("バックアップを準備しています…"): st.session_state["backup_blob"]=make_system_backup()
+        if st.session_state.get("backup_blob"):
+            st.download_button("システムバックアップをダウンロード",st.session_state["backup_blob"],f"yesno_system_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json","application/json",use_container_width=True,key="system_backup_download")
+        restore_file=st.file_uploader("バックアップから復元",type=["json"],key="system_backup_restore")
+        if restore_file and st.button("このバックアップを復元する",key="system_backup_restore_btn"):
+            try: restore_system_backup(restore_file.getvalue()); st.success("バックアップを復元しました。"); st.rerun()
+            except Exception as e: st.error(f"復元できませんでした：{e}")
         st.markdown("#### 共通SMTP設定")
         if smtp_ready():
-            verify_text = "証明書検証ON" if SMTP_TLS_VERIFY else "証明書検証OFF（互換モード）"
+            verify_text="証明書検証ON" if SMTP_TLS_VERIFY else "証明書検証OFF（互換モード）"
             st.success(f"共通SMTP設定済み：{SMTP_FROM_EMAIL} → {SMTP_HOST}:{SMTP_PORT} / {SMTP_SECURITY} / {verify_text}")
-        else:
-            st.error("SMTP設定が未完了のため、メールは送信されません。Streamlitの Settings → Secrets に下記を設定してください。")
-        st.code('''SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USERNAME = "共通送信用Gmailアドレス"
-SMTP_PASSWORD = "Googleの16桁アプリパスワード"
-SMTP_SECURITY = "starttls"
-SMTP_FROM_EMAIL = "共通送信用Gmailアドレス"
-SMTP_TLS_VERIFY = true''', language="toml")
-        st.caption("現在の推奨設定は Gmail SMTP（587 + STARTTLS）です。学会ごとの事務局アドレスは、各学会設定の Reply-To・CC先で切り替えます。")
-        test_to = st.text_input("テスト送信先メールアドレス", key="smtp_test_to")
-        if st.button("SMTPテストメールを送信", disabled=not smtp_ready(), key="smtp_test_btn"):
+        else: st.error("SMTP設定が未完了のため、メールは送信されません。")
+        st.code('SMTP_HOST = "smtp.gmail.com"\nSMTP_PORT = 587\nSMTP_USERNAME = "共通送信用Gmailアドレス"\nSMTP_PASSWORD = "Googleの16桁アプリパスワード"\nSMTP_SECURITY = "starttls"\nSMTP_FROM_EMAIL = "共通送信用Gmailアドレス"\nSMTP_TLS_VERIFY = true', language="toml")
+        test_to=st.text_input("テスト送信先メールアドレス",key="smtp_test_to")
+        if st.button("SMTPテストメールを送信",disabled=not smtp_ready(),key="smtp_test_btn"):
             try:
-                send_email_message(test_to.strip(), "【テスト】登壇諾否マイページ メール送信確認", "このメールが届けば、SMTP設定は正常です。", "登壇諾否マイページ")
-                st.success(f"テストメールを {test_to.strip()} に送信しました。")
-            except Exception as e:
-                err = str(e)
-                if "535" in err or "authentication failed" in err.lower():
-                    st.error("SMTPサーバーには接続できましたが、認証に失敗しました。SMTP_USERNAME / SMTP_PASSWORD と、Shuriken側の『SMTP認証に受信サーバーのアカウント情報を使う』設定を確認してください。\n\n詳細：" + err)
-                else:
-                    st.error(f"テストメールを送信できませんでした：{err}")
+                send_email_message(test_to.strip(),"【テスト】登壇諾否マイページ メール送信確認","このメールが届けば、SMTP設定は正常です。","登壇諾否マイページ"); st.success(f"テストメールを {test_to.strip()} に送信しました。")
+            except Exception as e: st.error(f"テストメールを送信できませんでした：{e}")
 
 
 init_db()

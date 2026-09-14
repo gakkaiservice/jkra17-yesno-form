@@ -8,7 +8,6 @@ import ssl
 import uuid
 import json
 import base64
-import time
 from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
@@ -19,7 +18,7 @@ from python_calamine import CalamineWorkbook
 import xlsxwriter
 from sqlalchemy import create_engine, text
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.3（高速キャッシュ版）"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1.2"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -37,28 +36,17 @@ DATABASE_URL = get_secret("DATABASE_URL", "").strip()
 
 # DATABASE_URL が設定されていれば外部PostgreSQLへ保存。未設定時は従来どおりローカルSQLite。
 # Streamlit Community Cloud ではローカルファイルは永続ではないため、本番運用では DATABASE_URL を推奨。
-@st.cache_resource(show_spinner=False)
-def build_engine(database_url, db_path):
-    """DBエンジンと接続プールをStreamlit再実行間で使い回す。"""
-    if database_url:
-        db_url = database_url
-        if db_url.startswith("postgresql://"):
-            db_url = "postgresql+pg8000://" + db_url[len("postgresql://"):]
-        elif db_url.startswith("postgres://"):
-            db_url = "postgresql+pg8000://" + db_url[len("postgres://"):]
-        # Session pooler側で接続管理されるため、毎回pre_pingを行わず往復回数を減らす。
-        return create_engine(
-            db_url,
-            pool_pre_ping=False,
-            pool_recycle=300,
-            pool_size=5,
-            max_overflow=2,
-            future=True,
-        )
-    return create_engine(f"sqlite:///{db_path}", future=True)
-
-ENGINE = build_engine(DATABASE_URL, DB_PATH)
-DB_BACKEND = "PostgreSQL（永続保存）" if DATABASE_URL else "SQLite（ローカル）"
+if DATABASE_URL:
+    db_url = DATABASE_URL
+    if db_url.startswith("postgresql://"):
+        db_url = "postgresql+pg8000://" + db_url[len("postgresql://"):]
+    elif db_url.startswith("postgres://"):
+        db_url = "postgresql+pg8000://" + db_url[len("postgres://"):]
+    ENGINE = create_engine(db_url, pool_pre_ping=True, future=True)
+    DB_BACKEND = "PostgreSQL（永続保存）"
+else:
+    ENGINE = create_engine(f"sqlite:///{DB_PATH}", future=True)
+    DB_BACKEND = "SQLite（ローカル）"
 
 # 共通メール送信設定（Streamlit Secretsで1回だけ設定）
 SMTP_HOST = get_secret("SMTP_HOST", "").strip()
@@ -174,32 +162,8 @@ def db_executemany(sql, seq):
         con.execute(text(sql), seq)
 
 
-def session_cache_get(key, loader, ttl=120):
-    """ブラウザセッション内キャッシュ。個人情報を他セッションと共有しない。"""
-    cache = st.session_state.setdefault("_read_cache", {})
-    now = time.time()
-    item = cache.get(key)
-    if item and (now - item[0]) < ttl:
-        return item[1]
-    value = loader()
-    cache[key] = (now, value)
-    return value
-
-
-def clear_session_cache(prefix=None):
-    cache = st.session_state.get("_read_cache", {})
-    if prefix is None:
-        cache.clear()
-        return
-    for key in list(cache.keys()):
-        if str(key).startswith(prefix):
-            cache.pop(key, None)
-
-
-@st.cache_resource(show_spinner=False)
-def init_db_once(_engine, backend_key):
-    engine = _engine
-    is_pg = engine.dialect.name == "postgresql"
+def init_db():
+    is_pg = ENGINE.dialect.name == "postgresql"
     id_col = "BIGSERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
     blob_col = "BYTEA" if is_pg else "BLOB"
     statements = [f"""
@@ -256,7 +220,7 @@ def init_db_once(_engine, backend_key):
             content {blob_col} NOT NULL, created_at TEXT NOT NULL
         )
     """]
-    with engine.begin() as con:
+    with ENGINE.begin() as con:
         for stmt in statements:
             con.execute(text(stmt))
         # 将来の更新で列が増えても既存DBを壊さない。PostgreSQLでは IF NOT EXISTS が使える。
@@ -298,30 +262,19 @@ def request_id(conf_code, row_no, seq_no, session, role, name):
 
 
 def list_conferences(active_only=False):
-    key = f"conferences:{int(active_only)}"
-    def load():
-        q = "SELECT * FROM conferences"
-        if active_only:
-            q += " WHERE active=1"
-        q += " ORDER BY id DESC"
-        return db_fetchall(q)
-    return session_cache_get(key, load, ttl=120)
+    q = "SELECT * FROM conferences"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY id DESC"
+    return db_fetchall(q)
 
 
 def get_conference_by_code(code):
-    return session_cache_get(
-        f"conference_code:{code}",
-        lambda: db_fetchone("SELECT * FROM conferences WHERE code=:code", {"code": code}),
-        ttl=120,
-    )
+    return db_fetchone("SELECT * FROM conferences WHERE code=:code", {"code": code})
 
 
 def get_conference(cid):
-    return session_cache_get(
-        f"conference_id:{cid}",
-        lambda: db_fetchone("SELECT * FROM conferences WHERE id=:id", {"id": cid}),
-        ttl=120,
-    )
+    return db_fetchone("SELECT * FROM conferences WHERE id=:id", {"id": cid})
 
 
 def create_conference(values):
@@ -345,7 +298,6 @@ def create_conference(values):
         "reply_to_email": values.get("reply_to_email", ""), "auto_reply_subject": values.get("auto_reply_subject", ""),
         "auto_reply_body": values.get("auto_reply_body", ""), "office_subject": "", "office_body": "", "created_at": now,
     })
-    clear_session_cache()
 
 
 def update_conference(cid, values):
@@ -368,7 +320,6 @@ def update_conference(cid, values):
             sender_name=:sender_name,reply_to_email=:reply_to_email,auto_reply_subject=:auto_reply_subject,
             auto_reply_body=:auto_reply_body,office_subject=:office_subject,office_body=:office_body WHERE id=:id
     """, params)
-    clear_session_cache()
 
 
 def delete_conference(cid):
@@ -379,7 +330,6 @@ def delete_conference(cid):
         con.execute(text("DELETE FROM requests WHERE conference_id=:cid"), params)
         con.execute(text("DELETE FROM people WHERE conference_id=:cid"), params)
         con.execute(text("DELETE FROM conferences WHERE id=:cid"), params)
-    clear_session_cache()
 
 
 def excel_col(n):
@@ -434,7 +384,7 @@ def auto_mapping(headers):
         "schedule": first_index(idx, ["候補日時", "日時", "登壇日時"]),
         "answer": first_index(idx, ["諾否", "回答", "諾否回答"], "first"),
         "deadline": first_index(idx, ["諾否締切", "回答期限", "締切"]),
-        "sent": first_index(idx, ["依頼送信", "依頼状況", "送信状況"]),
+        "sent": first_index(idx, ["依頼送付", "依頼送信", "依頼状況", "送信状況"]),
         "seq": first_index(idx, ["スプシセッション順No.", "依頼ID", "No.", "番号"]),
     }
     legacy = {
@@ -466,7 +416,7 @@ def mapping_display(headers, mapping):
     rows = []
     labels = {
         "name":"氏名", "session":"セッション名", "role":"役割", "affiliation":"所属", "email":"メール",
-        "theme":"テーマ", "schedule":"日時", "answer":"既存諾否", "deadline":"回答期限", "sent":"依頼状況", "seq":"依頼ID/順番"
+        "theme":"テーマ", "schedule":"日時", "answer":"既存諾否", "deadline":"回答期限", "sent":"依頼送付", "seq":"依頼ID/順番"
     }
     for k, label in labels.items():
         i = mapping.get(k)
@@ -500,6 +450,10 @@ def import_master(conf, file_bytes, sheet_name=None):
         source_answer = normalize_answer(cell(row, mapping["answer"]))
         deadline = clean(cell(row, mapping["deadline"])) or clean(conf["reply_deadline"])
         sent = clean(cell(row, mapping["sent"]))
+        # 「依頼送付」系の列が存在する場合は、値が入っている依頼だけを公開対象として取り込む。
+        # 列自体がない学会Excelでは従来どおり全依頼を取り込む。
+        if mapping["sent"] is not None and not sent:
+            continue
         seq = clean(cell(row, mapping["seq"]))
         token = conference_token(conf["code"], email, name)
         rid = request_id(conf["code"], excel_row, seq, session, role, name)
@@ -573,7 +527,6 @@ def import_master(conf, file_bytes, sheet_name=None):
         if profiles:
             con.execute(profile_sql, list(profiles.values()))
 
-    clear_session_cache()
     return records, list(profiles.values()), headers, mapping
 
 
@@ -600,54 +553,30 @@ def upsert_profile(p, overwrite=False):
         "special_request": p.get("special_request", ""), "upload_name": p.get("upload_name", ""), "upload_path": p.get("upload_path", ""),
         "registered_at": p.get("registered_at", ""), "source": p.get("source", "system")
     })
-    clear_session_cache(f"user_bundle:{p['conference_id']}:{p['token']}")
-
-
-def get_user_bundle(conf_id, token):
-    """先生ページに必要な依頼・プロフィールを1接続でまとめて取得し、セッション内で再利用。"""
-    key = f"user_bundle:{conf_id}:{token}"
-    def load():
-        with ENGINE.connect() as con:
-            rows = [dict(r._mapping) for r in con.execute(text("""
-                SELECT r.*, s.answer AS new_answer, s.decline_reason, s.note, s.responded_at
-                FROM requests r LEFT JOIN responses s ON s.request_id=r.request_id
-                WHERE r.conference_id=:cid AND r.token=:token ORDER BY r.source_row
-            """), {"cid": conf_id, "token": token}).fetchall()]
-            prow = con.execute(
-                text("SELECT * FROM people WHERE conference_id=:cid AND token=:token"),
-                {"cid": conf_id, "token": token},
-            ).fetchone()
-            profile = dict(prow._mapping) if prow else None
-        return {"rows": rows, "profile": profile}
-    return session_cache_get(key, load, ttl=120)
 
 
 def get_profile(conf_id, token):
-    return get_user_bundle(conf_id, token)["profile"]
+    return db_fetchone("SELECT * FROM people WHERE conference_id=:cid AND token=:token", {"cid": conf_id, "token": token})
 
 
 def get_person_requests(conf_id, token):
-    return get_user_bundle(conf_id, token)["rows"]
+    return db_fetchall("""
+        SELECT r.*, s.answer AS new_answer, s.decline_reason, s.note, s.responded_at
+        FROM requests r LEFT JOIN responses s ON s.request_id=r.request_id
+        WHERE r.conference_id=:cid AND r.token=:token ORDER BY r.source_row
+    """, {"cid": conf_id, "token": token})
 
 
 def all_rows(conf_id):
-    return session_cache_get(
-        f"all_rows:{conf_id}",
-        lambda: db_fetchall("""
-            SELECT r.*, s.answer AS new_answer, s.decline_reason, s.note, s.responded_at
-            FROM requests r LEFT JOIN responses s ON s.request_id=r.request_id
-            WHERE r.conference_id=:cid ORDER BY r.source_row
-        """, {"cid": conf_id}),
-        ttl=15,
-    )
+    return db_fetchall("""
+        SELECT r.*, s.answer AS new_answer, s.decline_reason, s.note, s.responded_at
+        FROM requests r LEFT JOIN responses s ON s.request_id=r.request_id
+        WHERE r.conference_id=:cid ORDER BY r.source_row
+    """, {"cid": conf_id})
 
 
 def all_people(conf_id):
-    return session_cache_get(
-        f"all_people:{conf_id}",
-        lambda: db_fetchall("SELECT * FROM people WHERE conference_id=:cid ORDER BY name", {"cid": conf_id}),
-        ttl=60,
-    )
+    return db_fetchall("SELECT * FROM people WHERE conference_id=:cid ORDER BY name", {"cid": conf_id})
 
 
 def effective_answer(r):
@@ -666,7 +595,6 @@ def save_response(conf_id, request_id_value, answer, decline_reason, note):
         ON CONFLICT(request_id) DO UPDATE SET answer=excluded.answer,decline_reason=excluded.decline_reason,note=excluded.note,responded_at=excluded.responded_at
     """, {"request_id": request_id_value, "conference_id": conf_id, "answer": answer, "decline_reason": clean(decline_reason),
             "note": clean(note), "responded_at": datetime.now().isoformat(timespec="seconds")})
-    clear_session_cache()
 
 
 def save_upload(conf_code, token, upload, conference_id=None):
@@ -1092,8 +1020,7 @@ def user_page(conf_code, token):
         hero(APP_NAME, "ご依頼内容の確認・諾否回答")
         st.error("この学会の回答ページは現在利用できません。")
         return
-    bundle = get_user_bundle(conf["id"], token)
-    rows = bundle["rows"]
+    rows = get_person_requests(conf["id"], token)
     if not rows:
         hero(conf["name"], "ご依頼内容の確認・諾否回答")
         st.error("このURLに該当するご依頼が見つかりません。")
@@ -1103,7 +1030,7 @@ def user_page(conf_code, token):
     show_flash()
     pending = [r for r in rows if not effective_answer(r)]
     done = [r for r in rows if effective_answer(r)]
-    p = bundle["profile"]
+    p = get_profile(conf["id"], token)
     if p:
         subsequent_form(conf, p, rows, pending)
     elif pending:
@@ -1139,8 +1066,8 @@ def make_export(conf):
 
 
 def url_summary_rows(conf_id):
-    """先生別URL画面用の集計を1回取得し、セッション内で再利用する。"""
-    return session_cache_get(f"url_summary:{conf_id}", lambda: db_fetchall("""
+    """先生別URL画面用の集計をDB側で一括計算する。"""
+    return db_fetchall("""
         SELECT
             r.token,
             MAX(r.name) AS name,
@@ -1156,7 +1083,7 @@ def url_summary_rows(conf_id):
         WHERE r.conference_id=:cid
         GROUP BY r.token
         ORDER BY MAX(r.name)
-    """, {"cid": conf_id}), ttl=15)
+    """, {"cid": conf_id})
 
 
 def make_url_export_from_summaries(conf, summaries, mode="all"):
@@ -1347,14 +1274,6 @@ def admin_page():
         labels={f"{c['code']}｜{c['name']}":c for c in confs}
         selected=st.selectbox("管理する学会",list(labels.keys()), key="manage_conf_select")
         conf=labels[selected]
-        c_refresh, c_note = st.columns([1,4])
-        if c_refresh.button("最新データを再読み込み", key=f"refresh_{conf['id']}"):
-            clear_session_cache()
-            for k in list(st.session_state.keys()):
-                if k.startswith("url_exports_") or k.startswith("answer_export_"):
-                    st.session_state.pop(k, None)
-            st.rerun()
-        c_note.caption("通常はキャッシュから高速表示します。外部更新を反映したい時だけ再読み込みしてください。")
         manage_menu=st.radio("学会管理メニュー",["回答状況","Excel取込","先生別URL","学会設定","先生情報"],horizontal=True,label_visibility="collapsed",key=f"manage_menu_{conf['id']}")
 
         if manage_menu == "回答状況":
@@ -1363,12 +1282,7 @@ def admin_page():
                 data.append({"元Excel行":r['source_row'],"氏名":r['name'],"セッション":r['session_name'],"役割":r['role'],"既存":r['source_answer'] or '',"新回答":r['new_answer'] or '',"現在":effective_answer(r) or '未回答',"回答日時":r['responded_at'] or ''})
             st.dataframe(data,use_container_width=True,hide_index=True)
             if rows:
-                exp_key=f"answer_export_{conf['id']}"
-                if st.button("回答一覧Excelを準備", key=f"prepare_answer_export_{conf['id']}"):
-                    with st.spinner("Excelを準備しています…"):
-                        st.session_state[exp_key]=make_export(conf)
-                if st.session_state.get(exp_key):
-                    st.download_button("回答一覧をExcelでダウンロード",st.session_state[exp_key],f"{conf['code']}_諾否回答一覧.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+                st.download_button("回答一覧をExcelでダウンロード",make_export(conf),f"{conf['code']}_諾否回答一覧.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
         elif manage_menu == "Excel取込":
             st.write("この学会の指定演題・登壇者Excelを取り込みます。氏名／セッション／役割などは見出し名から自動判定します。")
@@ -1399,21 +1313,15 @@ def admin_page():
             st.dataframe(urls,use_container_width=True,hide_index=True)
             if summaries:
                 st.markdown("#### URL一覧をExcelでダウンロード")
-                prep_key=f"url_exports_{conf['id']}"
-                if st.button("Excel出力を準備", key=f"prepare_url_exports_{conf['id']}"):
-                    with st.spinner("Excelを準備しています…"):
-                        data_all,n_all=make_url_export_from_summaries(conf,summaries,"all")
-                        data_pending,n_pending=make_url_export_from_summaries(conf,summaries,"pending")
-                        data_add,n_add=make_url_export_from_summaries(conf,summaries,"additional")
-                        reminder_data,reminder_count=make_reminder_export(conf)
-                        st.session_state[prep_key]=(data_all,n_all,data_pending,n_pending,data_add,n_add,reminder_data,reminder_count)
-                if st.session_state.get(prep_key):
-                    data_all,n_all,data_pending,n_pending,data_add,n_add,reminder_data,reminder_count=st.session_state[prep_key]
-                    c_all,c_pending,c_add=st.columns(3)
-                    c_all.download_button(f"全員（{n_all}名）",data_all,f"{conf['code']}_先生別URL_全員.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_all_{conf['id']}")
-                    c_pending.download_button(f"未回答あり（{n_pending}名）",data_pending,f"{conf['code']}_先生別URL_未回答.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_pending_{conf['id']}")
-                    c_add.download_button(f"追加依頼あり（{n_add}名）",data_add,f"{conf['code']}_先生別URL_追加依頼.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_add_{conf['id']}")
-                    st.download_button(f"未回答者 催促メール用Excel（{reminder_count}名）",reminder_data,f"{conf['code']}_未回答者_催促メール用.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"reminder_{conf['id']}")
+                c_all,c_pending,c_add=st.columns(3)
+                data_all,n_all=make_url_export_from_summaries(conf,summaries,"all")
+                data_pending,n_pending=make_url_export_from_summaries(conf,summaries,"pending")
+                data_add,n_add=make_url_export_from_summaries(conf,summaries,"additional")
+                c_all.download_button(f"全員（{n_all}名）",data_all,f"{conf['code']}_先生別URL_全員.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_all_{conf['id']}")
+                c_pending.download_button(f"未回答あり（{n_pending}名）",data_pending,f"{conf['code']}_先生別URL_未回答.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_pending_{conf['id']}")
+                c_add.download_button(f"追加依頼あり（{n_add}名）",data_add,f"{conf['code']}_先生別URL_追加依頼.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"url_add_{conf['id']}")
+                reminder_data,reminder_count=make_reminder_export(conf)
+                st.download_button(f"未回答者 催促メール用Excel（{reminder_count}名）",reminder_data,f"{conf['code']}_未回答者_催促メール用.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key=f"reminder_{conf['id']}")
 
         elif manage_menu == "学会設定":
             values=conference_settings_form(conf,key_prefix=f"edit_{conf['id']}")
@@ -1460,7 +1368,7 @@ def admin_page():
             except Exception as e: st.error(f"テストメールを送信できませんでした：{e}")
 
 
-init_db_once(ENGINE, DATABASE_URL or DB_PATH)
+init_db()
 params=st.query_params
 if params.get("admin") == "1":
     admin_page()

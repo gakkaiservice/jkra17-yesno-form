@@ -17,10 +17,8 @@ import streamlit as st
 from python_calamine import CalamineWorkbook
 import xlsxwriter
 from sqlalchemy import create_engine, text
-import gspread
-from google.oauth2.service_account import Credentials
 
-APP_NAME = "登壇諾否マイページ｜共通管理版 v4.2"
+APP_NAME = "登壇諾否マイページ｜共通管理版 v4.1"
 DB_PATH = os.getenv("YESNO_DB_PATH", "yesno_common.db")
 ATTACH_DIR = Path(os.getenv("YESNO_ATTACH_DIR", "attachments"))
 
@@ -34,14 +32,21 @@ def get_secret(name, default=""):
 
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "")
 TOKEN_SECRET = get_secret("TOKEN_SECRET", "local-development-secret").encode("utf-8")
+DATABASE_URL = get_secret("DATABASE_URL", "").strip()
 
-# v4.2: 作業用DBはSQLiteのまま使用し、Googleスプレッドシートを永続保存先にする。
-# Streamlitが再起動してローカルSQLiteが消えても、起動時にスプレッドシートから復元する。
-ENGINE = create_engine(f"sqlite:///{DB_PATH}", future=True)
-DB_BACKEND = "Googleスプレッドシート連携"
-
-GOOGLE_SHEETS_SPREADSHEET_ID = get_secret("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
-GOOGLE_SHEETS_AUTO_SYNC = str(get_secret("GOOGLE_SHEETS_AUTO_SYNC", "true")).strip().lower() not in {"0", "false", "no", "off"}
+# DATABASE_URL が設定されていれば外部PostgreSQLへ保存。未設定時は従来どおりローカルSQLite。
+# Streamlit Community Cloud ではローカルファイルは永続ではないため、本番運用では DATABASE_URL を推奨。
+if DATABASE_URL:
+    db_url = DATABASE_URL
+    if db_url.startswith("postgresql://"):
+        db_url = "postgresql+pg8000://" + db_url[len("postgresql://"):]
+    elif db_url.startswith("postgres://"):
+        db_url = "postgresql+pg8000://" + db_url[len("postgres://"):]
+    ENGINE = create_engine(db_url, pool_pre_ping=True, future=True)
+    DB_BACKEND = "PostgreSQL（永続保存）"
+else:
+    ENGINE = create_engine(f"sqlite:///{DB_PATH}", future=True)
+    DB_BACKEND = "SQLite（ローカル）"
 
 # 共通メール送信設定（Streamlit Secretsで1回だけ設定）
 SMTP_HOST = get_secret("SMTP_HOST", "").strip()
@@ -155,211 +160,6 @@ def db_execute(sql, params=None):
 def db_executemany(sql, seq):
     with ENGINE.begin() as con:
         con.execute(text(sql), seq)
-
-
-SHEET_TABLES = ["conferences", "people", "requests", "responses", "stored_files"]
-SHEET_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
-
-
-def google_sheets_credentials_info():
-    """Return service-account information from Streamlit Secrets.
-
-    Expected format:
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "..."
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-    client_email = "...@...iam.gserviceaccount.com"
-    client_id = "..."
-    token_uri = "https://oauth2.googleapis.com/token"
-    """
-    try:
-        section = st.secrets.get("gcp_service_account", None)
-        if not section:
-            return None
-        return {k: section[k] for k in section.keys()}
-    except Exception:
-        return None
-
-
-def google_sheets_ready():
-    return bool(GOOGLE_SHEETS_SPREADSHEET_ID and google_sheets_credentials_info())
-
-
-@st.cache_resource(show_spinner=False)
-def get_google_spreadsheet():
-    if not google_sheets_ready():
-        return None
-    info = google_sheets_credentials_info()
-    creds = Credentials.from_service_account_info(info, scopes=SHEET_SCOPES)
-    client = gspread.authorize(creds)
-    return client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
-
-
-def _sheet_or_create(spreadsheet, title, rows=1000, cols=30):
-    try:
-        return spreadsheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
-
-
-def _normalize_sheet_value(v):
-    if v is None:
-        return ""
-    if isinstance(v, (bytes, bytearray, memoryview)):
-        return base64.b64encode(bytes(v)).decode("ascii")
-    return str(v)
-
-
-def _read_table_columns(table):
-    with ENGINE.connect() as con:
-        rows = con.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
-    return [r[1] for r in rows]
-
-
-def sync_db_to_google_sheets():
-    """Mirror the full SQLite database to one Google Spreadsheet.
-
-    The spreadsheet is the durable copy.  `stored_files` is special-cased:
-    binary files are base64 encoded and split into chunks so Google Sheets'
-    per-cell character limit is not exceeded.
-    """
-    if not google_sheets_ready():
-        return False, "Googleスプレッドシート設定が未完了です。"
-    ss = get_google_spreadsheet()
-    chunk_size = 40000
-    for table in SHEET_TABLES:
-        ws = _sheet_or_create(ss, table)
-        rows = db_fetchall(f"SELECT * FROM {table}")
-        if table != "stored_files":
-            headers = _read_table_columns(table)
-            values = [headers]
-            for row in rows:
-                values.append([_normalize_sheet_value(row.get(h)) for h in headers])
-        else:
-            headers = ["file_id", "conference_id", "token", "filename", "part_no", "content_b64_part", "created_at"]
-            values = [headers]
-            for row in rows:
-                b64 = base64.b64encode(bytes(row.get("content") or b"")).decode("ascii")
-                parts = [b64[i:i+chunk_size] for i in range(0, len(b64), chunk_size)] or [""]
-                for i, part in enumerate(parts, start=1):
-                    values.append([
-                        _normalize_sheet_value(row.get("file_id")),
-                        _normalize_sheet_value(row.get("conference_id")),
-                        _normalize_sheet_value(row.get("token")),
-                        _normalize_sheet_value(row.get("filename")),
-                        str(i), part,
-                        _normalize_sheet_value(row.get("created_at")),
-                    ])
-        ws.clear()
-        if values:
-            ws.update(values, value_input_option="RAW")
-    meta = _sheet_or_create(ss, "_system", rows=20, cols=4)
-    meta.clear()
-    meta.update([
-        ["key", "value"],
-        ["app_version", "4.2"],
-        ["last_synced_at", datetime.now().isoformat(timespec="seconds")],
-        ["storage", "Google Sheets"],
-    ], value_input_option="RAW")
-    return True, f"Googleスプレッドシートへ保存しました：{ss.title}"
-
-
-def _coerce_db_value(table, col, value):
-    # SQLite is permissive, but IDs/flags are easier to use as integers.
-    int_cols = {
-        "conferences": {"id","active","ask_furigana","ask_membership","ask_mobile","ask_correction","invitation_enabled","auto_reply_enabled","office_notify_enabled"},
-        "people": {"conference_id"},
-        "requests": {"conference_id","source_row"},
-        "responses": {"conference_id"},
-        "stored_files": {"conference_id"},
-    }
-    if value == "":
-        return None if col in int_cols.get(table, set()) else ""
-    if col in int_cols.get(table, set()):
-        try:
-            return int(float(value))
-        except Exception:
-            return 0
-    return value
-
-
-def restore_db_from_google_sheets():
-    """Replace local SQLite data with the durable copy in Google Sheets."""
-    if not google_sheets_ready():
-        return False, "Googleスプレッドシート設定が未完了です。"
-    ss = get_google_spreadsheet()
-    table_data = {}
-    found_any = False
-    for table in SHEET_TABLES:
-        try:
-            ws = ss.worksheet(table)
-        except gspread.WorksheetNotFound:
-            table_data[table] = []
-            continue
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            table_data[table] = []
-            continue
-        found_any = True
-        headers = values[0]
-        if table != "stored_files":
-            items = []
-            for vals in values[1:]:
-                vals = vals + [""] * (len(headers) - len(vals))
-                row = {h: _coerce_db_value(table, h, vals[i]) for i, h in enumerate(headers) if h}
-                items.append(row)
-            table_data[table] = items
-        else:
-            grouped = {}
-            for vals in values[1:]:
-                vals = vals + [""] * (len(headers) - len(vals))
-                row = {h: vals[i] for i, h in enumerate(headers) if h}
-                fid = row.get("file_id", "")
-                if not fid:
-                    continue
-                item = grouped.setdefault(fid, {
-                    "file_id": fid,
-                    "conference_id": int(row.get("conference_id") or 0),
-                    "token": row.get("token", ""),
-                    "filename": row.get("filename", ""),
-                    "parts": [],
-                    "created_at": row.get("created_at", ""),
-                })
-                try:
-                    part_no = int(row.get("part_no") or 0)
-                except Exception:
-                    part_no = 0
-                item["parts"].append((part_no, row.get("content_b64_part", "")))
-            files = []
-            for item in grouped.values():
-                b64 = "".join(part for _, part in sorted(item.pop("parts")))
-                item["content"] = base64.b64decode(b64) if b64 else b""
-                files.append(item)
-            table_data[table] = files
-    if not found_any:
-        return False, "スプレッドシートに保存済みデータがまだありません。"
-
-    with ENGINE.begin() as con:
-        for table in ["stored_files", "responses", "requests", "people", "conferences"]:
-            con.execute(text(f"DELETE FROM {table}"))
-        for table in SHEET_TABLES:
-            for row in table_data.get(table, []):
-                if not row:
-                    continue
-                cols = list(row.keys())
-                con.execute(text(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join(':'+c for c in cols)})"), row)
-    return True, f"Googleスプレッドシートから復元しました：{ss.title}"
-
-
-def persist_if_configured():
-    if GOOGLE_SHEETS_AUTO_SYNC and google_sheets_ready():
-        return sync_db_to_google_sheets()
-    return False, ""
 
 
 def init_db():
@@ -498,7 +298,6 @@ def create_conference(values):
         "reply_to_email": values.get("reply_to_email", ""), "auto_reply_subject": values.get("auto_reply_subject", ""),
         "auto_reply_body": values.get("auto_reply_body", ""), "office_subject": "", "office_body": "", "created_at": now,
     })
-    persist_if_configured()
 
 
 def update_conference(cid, values):
@@ -521,7 +320,6 @@ def update_conference(cid, values):
             sender_name=:sender_name,reply_to_email=:reply_to_email,auto_reply_subject=:auto_reply_subject,
             auto_reply_body=:auto_reply_body,office_subject=:office_subject,office_body=:office_body WHERE id=:id
     """, params)
-    persist_if_configured()
 
 
 def delete_conference(cid):
@@ -532,7 +330,6 @@ def delete_conference(cid):
         con.execute(text("DELETE FROM requests WHERE conference_id=:cid"), params)
         con.execute(text("DELETE FROM people WHERE conference_id=:cid"), params)
         con.execute(text("DELETE FROM conferences WHERE id=:cid"), params)
-    persist_if_configured()
 
 
 def excel_col(n):
@@ -703,12 +500,11 @@ def import_master(conf, file_bytes, sheet_name=None):
                 deadline=excluded.deadline,request_sent=excluded.request_sent,imported_at=excluded.imported_at
             """), params)
     for p in profiles.values():
-        upsert_profile(p, overwrite=False, sync=False)
-    persist_if_configured()
+        upsert_profile(p, overwrite=False)
     return records, list(profiles.values()), headers, mapping
 
 
-def upsert_profile(p, overwrite=False, sync=True):
+def upsert_profile(p, overwrite=False):
     current = db_fetchone("SELECT * FROM people WHERE conference_id=:cid AND token=:token", {"cid": p["conference_id"], "token": p["token"]})
     if current and not overwrite and current.get("source") == "system":
         return
@@ -731,8 +527,6 @@ def upsert_profile(p, overwrite=False, sync=True):
         "special_request": p.get("special_request", ""), "upload_name": p.get("upload_name", ""), "upload_path": p.get("upload_path", ""),
         "registered_at": p.get("registered_at", ""), "source": p.get("source", "system")
     })
-    if sync:
-        persist_if_configured()
 
 
 def get_profile(conf_id, token):
@@ -775,7 +569,6 @@ def save_response(conf_id, request_id_value, answer, decline_reason, note):
         ON CONFLICT(request_id) DO UPDATE SET answer=excluded.answer,decline_reason=excluded.decline_reason,note=excluded.note,responded_at=excluded.responded_at
     """, {"request_id": request_id_value, "conference_id": conf_id, "answer": answer, "decline_reason": clean(decline_reason),
             "note": clean(note), "responded_at": datetime.now().isoformat(timespec="seconds")})
-    persist_if_configured()
 
 
 def save_upload(conf_code, token, upload, conference_id=None):
@@ -796,7 +589,6 @@ def save_upload(conf_code, token, upload, conference_id=None):
         VALUES(:file_id,:conference_id,:token,:filename,:content,:created_at)
     """, {"file_id": file_id, "conference_id": int(conference_id or 0), "token": token, "filename": safe,
             "content": data, "created_at": datetime.now().isoformat(timespec="seconds")})
-    persist_if_configured()
     return upload.name, f"db:{file_id}"
 
 
@@ -814,7 +606,7 @@ BACKUP_TABLES = ["conferences", "people", "requests", "responses", "stored_files
 
 
 def make_system_backup():
-    payload = {"version": "4.2", "created_at": datetime.now().isoformat(timespec="seconds"), "tables": {}}
+    payload = {"version": "4.1", "created_at": datetime.now().isoformat(timespec="seconds"), "tables": {}}
     for table in BACKUP_TABLES:
         rows = db_fetchall(f"SELECT * FROM {table}")
         cleaned = []
@@ -852,7 +644,8 @@ def restore_system_backup(file_bytes):
                 col_sql = ",".join(cols)
                 val_sql = ",".join(f":{c}" for c in cols)
                 con.execute(text(f"INSERT INTO {table} ({col_sql}) VALUES ({val_sql})"), decoded)
-    persist_if_configured()
+        if ENGINE.dialect.name == "postgresql":
+            con.execute(text("SELECT setval(pg_get_serial_sequence('conferences','id'), COALESCE((SELECT MAX(id) FROM conferences), 1), true)"))
 
 
 DEFAULT_AUTO_SUBJECT = "【回答受付】登壇諾否のご回答ありがとうございます"
@@ -1504,35 +1297,15 @@ def admin_page():
                 st.dataframe(ps,use_container_width=True,hide_index=True)
 
     with tabs[3]:
-        st.markdown("#### Googleスプレッドシート永続保存")
-        if google_sheets_ready():
-            try:
-                ss = get_google_spreadsheet()
-                st.success(f"永続保存先：Googleスプレッドシート『{ss.title}』に接続中です。回答・学会設定・先生情報を自動保存します。")
-                st.caption(f"Spreadsheet ID：{GOOGLE_SHEETS_SPREADSHEET_ID}")
-                c1, c2 = st.columns(2)
-                if c1.button("現在のデータをスプシへ保存", use_container_width=True, key="gsheets_push"):
-                    ok, msg = sync_db_to_google_sheets()
-                    (st.success if ok else st.warning)(msg)
-                if c2.button("スプシから最新データを読み込む", use_container_width=True, key="gsheets_pull"):
-                    ok, msg = restore_db_from_google_sheets()
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.warning(msg)
-            except Exception as e:
-                st.error(f"Googleスプレッドシートへ接続できません：{e}")
+        st.markdown("#### データ保存")
+        if DATABASE_URL:
+            st.success(f"永続保存：{DB_BACKEND} に接続中です。Streamlitの再起動・再デプロイ後も回答データが残ります。")
         else:
-            st.warning("Googleスプレッドシート連携がまだ未設定です。設定前はローカル保存のため、Streamlitの再起動・再デプロイでデータが消える可能性があります。")
-            st.markdown("設定はシステム全体で最初の1回だけです。学会ごとに設定する必要はありません。")
-            st.code('GOOGLE_SHEETS_SPREADSHEET_ID = "スプレッドシートID"\nGOOGLE_SHEETS_AUTO_SYNC = true\n\n[gcp_service_account]\ntype = "service_account"\nproject_id = "..."\nprivate_key_id = "..."\nprivate_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"\nclient_email = "...@...iam.gserviceaccount.com"\nclient_id = "..."\ntoken_uri = "https://oauth2.googleapis.com/token"', language="toml")
-            info = google_sheets_credentials_info()
-            if info and info.get("client_email"):
-                st.info(f"作成したGoogleスプレッドシートを、このサービスアカウントに『編集者』で共有してください：{info['client_email']}")
-
+            st.warning("現在はローカルSQLite保存です。Streamlit Community Cloudでは再起動・再デプロイでデータが消える可能性があります。")
+            st.caption("本番運用では Streamlit Secrets に DATABASE_URL を1行追加すると、外部PostgreSQLへ切り替わります。")
+            st.code('DATABASE_URL = "postgresql://ユーザー名:パスワード@ホスト名:5432/データベース名"', language="toml")
         st.markdown("##### システム全体のバックアップ")
-        st.caption("Googleスプレッドシート保存とは別に、念のため学会設定・先生情報・依頼・回答・アップロードファイルをJSONでも一括保存できます。")
+        st.caption("学会設定・先生情報・依頼・回答・アップロードファイルをまとめて保存します。永続DBへ切り替える前にも一度ダウンロードしてください。")
         st.download_button(
             "システムバックアップをダウンロード",
             make_system_backup(),
@@ -1580,15 +1353,6 @@ SMTP_TLS_VERIFY = true''', language="toml")
 
 
 init_db()
-# Googleスプレッドシートを永続保存先として使用する場合、各セッションの初回だけ復元する。
-# 保存済みシートが空なら現在のローカルデータをそのまま保持する。
-if google_sheets_ready() and not st.session_state.get("_gsheets_loaded", False):
-    try:
-        restore_db_from_google_sheets()
-    except Exception:
-        pass
-    st.session_state["_gsheets_loaded"] = True
-
 params=st.query_params
 if params.get("admin") == "1":
     admin_page()

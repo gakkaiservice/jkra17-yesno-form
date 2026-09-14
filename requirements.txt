@@ -2,5 +2,4 @@ streamlit>=1.63
 python-calamine>=0.8
 XlsxWriter>=3.2
 SQLAlchemy>=2.0
-gspread>=6.1
-google-auth>=2.35
+pg8000>=1.31
